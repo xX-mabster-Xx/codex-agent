@@ -133,3 +133,19 @@ def test_agent_telegram_approval_does_not_depend_on_item_correlation() -> None:
     )
 
     assert bot._is_auto_approved_telegram_request(request)
+
+
+def test_memory_mcp_approval_is_automatic() -> None:
+    bot = object.__new__(TelegramCodexBot)
+    bot.thread_to_key = {}
+    request = ServerRequest(
+        id=6,
+        method="mcpServer/elicitation/request",
+        params={
+            "serverName": "memory",
+            "mode": "form",
+            "_meta": {"codex_approval_kind": "mcp_tool_call"},
+        },
+    )
+
+    assert bot._is_memory_mcp_request(request)

@@ -2865,6 +2865,16 @@ class TelegramCodexBot:
             )
             return
 
+        if self._is_memory_mcp_request(request):
+            await self.codex.respond(request.id, self._approval_response(request, True))
+            log.info(
+                "Auto-approved shared memory MCP request key=%s tool=%s request_id=%s",
+                key,
+                self._mcp_tool_label(request) or "memory operation",
+                request.id,
+            )
+            return
+
         if self._is_auto_approved_telegram_request(request):
             await self.codex.respond(request.id, self._approval_response(request, True))
             log.info(
@@ -3305,6 +3315,15 @@ class TelegramCodexBot:
         # additionally skips only the harmless draft confirmation, and only
         # after correlation proves the pending call is save_draft.
         return account == "main" and tool == "telegram/save_draft"
+
+    def _is_memory_mcp_request(self, request: ServerRequest) -> bool:
+        """Memory is a local, shared knowledge store with user-approved scope."""
+        if not self._is_mcp_tool_approval(request):
+            return False
+        server = str(request.params.get("serverName") or "").casefold()
+        if server == "memory":
+            return True
+        return (self._pending_mcp_tool(request) or "").casefold().startswith("memory/")
 
     def _is_native_bot_delivery_request(self, request: ServerRequest) -> bool:
         if not self._is_mcp_tool_approval(request):
