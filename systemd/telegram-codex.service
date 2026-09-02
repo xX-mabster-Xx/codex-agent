@@ -1,0 +1,28 @@
+[Unit]
+Description=Telegram interface for local Codex
+Wants=network-online.target codex-sudo.service
+After=network-online.target xray.service codex-sudo.service
+Requires=xray.service
+BindsTo=xray.service
+
+[Service]
+Type=simple
+User=__RUN_AS_USER__
+Group=__RUN_AS_GROUP__
+WorkingDirectory=__PROJECT_DIR__
+Environment=HOME=__HOME_DIR__
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+Environment=PATH=__PATH__
+UMask=0077
+ExecStartPre=__VENV_PYTHON__ __PROJECT_DIR__/scripts/wait_for_tcp.py --host 127.0.0.1 --port 2060 --timeout 60
+ExecStart=__VENV_PYTHON__ -u __PROJECT_DIR__/bot.py
+Restart=always
+RestartSec=5
+StartLimitIntervalSec=0
+TimeoutStopSec=45
+KillMode=mixed
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

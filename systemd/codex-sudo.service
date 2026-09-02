@@ -1,0 +1,15 @@
+[Unit]
+Description=Local root executor for Codex sudo MCP
+After=local-fs.target
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/bin/python3 /opt/codex-sudo/sudo_daemon.py --socket /run/codex-sudo/daemon.sock --allowed-uid __ALLOWED_UID__ --approval-timeout-seconds 600
+Restart=on-failure
+RestartSec=2
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

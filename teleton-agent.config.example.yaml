@@ -1,0 +1,53 @@
+# Copy to /home/mabster/.teleton-agent/config.yaml only through Teleton's setup
+# wizard, or replace every <...> value yourself. Do not copy an existing
+# Telegram MCP session string into this file: Teleton must create its own login.
+agent:
+  provider: "codex"
+  api_key: ""
+  max_agentic_iterations: 5
+
+telegram:
+  mode: "user"
+  api_id: <TELEGRAM_API_ID>
+  api_hash: "<TELEGRAM_API_HASH>"
+  phone: "<AGENT_ACCOUNT_PHONE_IN_INTERNATIONAL_FORMAT>"
+  proxy:
+    type: "socks5"
+    host: "127.0.0.1"
+    port: 2060
+  session_name: "agent_teleton"
+  session_path: "/home/mabster/.teleton-agent"
+  dm_policy: "admin-only"
+  group_policy: "disabled"
+  require_mention: true
+  admin_ids: [<YOUR_TELEGRAM_USER_ID>]
+  owner_id: <YOUR_TELEGRAM_USER_ID>
+
+# Avoids onnxruntime-node and CUDA/model downloads. Teleton retains FTS5 search.
+embedding:
+  provider: "none"
+
+webui:
+  enabled: false
+  host: "127.0.0.1"
+
+ton_proxy:
+  enabled: false
+
+capabilities:
+  exec:
+    mode: "off"
+
+# No unattended LLM work or Telegram actions until you deliberately enable it.
+heartbeat:
+  enabled: false
+
+mcp:
+  servers:
+    codex_bridge:
+      command: "/home/mabster/progs/agent/.mcp-venv/bin/python"
+      args:
+        - "/home/mabster/progs/agent/teleton_bridge/server.py"
+      env:
+        TELETON_BRIDGE_ACTOR: "teleton"
+      scope: "admin-only"

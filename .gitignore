@@ -1,0 +1,15 @@
+.env
+.venv/
+__pycache__/
+*.py[cod]
+.sessions.json
+.sessions.tmp
+.full-access.json
+.trusted-write-dirs.json
+.telegram-codex-projects/
+logs/
+var/
+*.session
+
+# Upstream projects retain their own Git history and are versioned separately.
+third_party/

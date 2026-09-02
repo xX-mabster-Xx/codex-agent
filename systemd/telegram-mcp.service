@@ -1,0 +1,31 @@
+[Unit]
+Description=Shared local Telegram MCP server
+Wants=network-online.target xray.service
+After=network-online.target xray.service
+Requires=xray.service
+BindsTo=xray.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=__RUN_AS_USER__
+Group=__RUN_AS_GROUP__
+WorkingDirectory=__PROJECT_DIR__/third_party/telegram-mcp
+Environment=HOME=__HOME_DIR__
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONUTF8=1
+Environment=MCP_TRANSPORT=http
+Environment=MCP_HOST=127.0.0.1
+Environment=MCP_PORT=8765
+Environment=MCP_ALLOWED_HOSTS=127.0.0.1:8765,localhost:8765
+Environment=TELEGRAM_ALLOW_SERVER_ROOTS_FALLBACK=1
+UMask=0077
+ExecStart=__MCP_PYTHON__ __PROJECT_DIR__/third_party/telegram-mcp/main.py __PROJECT_DIR__
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+KillMode=mixed
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

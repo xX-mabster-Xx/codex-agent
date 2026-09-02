@@ -1,0 +1,17 @@
+[Unit]
+Description=Teleton agent (dedicated Telegram account)
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+WorkingDirectory=/home/mabster/progs/agent
+Environment=TELETON_AGENT_HOME=/home/mabster/.teleton-agent
+ExecStart=/usr/bin/zsh /home/mabster/progs/agent/scripts/run-teleton-agent.sh
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
