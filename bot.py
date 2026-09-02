@@ -3191,6 +3191,16 @@ class TelegramCodexBot:
         if len(candidates) == 1:
             return summary.mcp_tools[candidates[0]]
 
+        # Parallel calls to one MCP operation are common (for example a batch
+        # of Telegram media downloads).  An elicitation request does not carry
+        # an item id, but if every running candidate is the same operation the
+        # label is still unambiguous.  Returning it also keeps the agent
+        # account's autonomous Telegram policy from falling back to a manual
+        # approval card merely because several identical calls overlap.
+        candidate_tools = {summary.mcp_tools[item_id] for item_id in candidates}
+        if len(candidate_tools) == 1:
+            return next(iter(candidate_tools))
+
         arguments = self._mcp_elicitation_arguments(request)
         if not arguments:
             return None
@@ -3283,7 +3293,13 @@ class TelegramCodexBot:
         values = self._mcp_tool_values(request)
         account = str(values.get("account") or "").casefold()
         tool = (self._pending_mcp_tool(request) or "").casefold()
-        if account == "agent" and tool.startswith("telegram/"):
+        server = str(request.params.get("serverName") or "").casefold()
+        # `agent` intentionally has full Telegram MCP access.  Some
+        # elicitation packets omit the item id, and a batch can make the exact
+        # operation impossible to correlate.  The server identity is still
+        # present and sufficient for this account-level policy; `main` keeps
+        # its stricter per-tool check below.
+        if account == "agent" and (tool.startswith("telegram/") or server == "telegram"):
             return True
         # The Telegram MCP enforces main's per-account allowlist. The bot
         # additionally skips only the harmless draft confirmation, and only
