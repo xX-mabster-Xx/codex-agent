@@ -1947,21 +1947,33 @@ class TelegramCodexBot:
     ) -> None:
         token = secrets.token_urlsafe(8)
         self.busy_inputs[token] = PendingBusyInput(session.key, queued_input)
-        keyboard = InlineKeyboardMarkup(
-            inline_keyboard=[
+        rows: list[list[InlineKeyboardButton]] = []
+        if session.active_turn_id and session.thread_id and not session.stopping:
+            rows.append(
                 [
                     InlineKeyboardButton(
-                        text="⏩ Отправить сейчас",
-                        callback_data=f"busy:{token}:now",
+                        text="🧩 Добавить контекст без остановки",
+                        callback_data=f"busy:{token}:steer",
                         style="primary",
-                    ),
-                    InlineKeyboardButton(
-                        text="📥 Добавить в очередь",
-                        callback_data=f"busy:{token}:queue",
-                        style="success",
-                    ),
+                    )
                 ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="⏩ Отправить сейчас",
+                    callback_data=f"busy:{token}:now",
+                    style="primary",
+                ),
+                InlineKeyboardButton(
+                    text="📥 Добавить в очередь",
+                    callback_data=f"busy:{token}:queue",
+                    style="success",
+                ),
             ]
+        )
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=rows
         )
         try:
             await self._send_html(
@@ -2264,14 +2276,55 @@ class TelegramCodexBot:
         except ValueError:
             await callback.answer("Некорректная кнопка", show_alert=True)
             return
-        pending = self.busy_inputs.pop(token, None)
-        if not pending or action not in {"now", "queue"}:
+        pending = self.busy_inputs.get(token)
+        if not pending or action not in {"now", "queue", "steer"}:
             await callback.answer("Выбор устарел. Отправьте сообщение ещё раз.", show_alert=True)
             return
         session = self.sessions.get(pending.key)
         if not session:
+            self.busy_inputs.pop(token, None)
             await callback.answer("Сессия больше не существует", show_alert=True)
             return
+
+        if action == "steer":
+            try:
+                accepted = await self._steer_active_turn(session, pending.queued_input.input_items)
+            except CodexRPCError as error:
+                self.busy_inputs.pop(token, None)
+                log.warning("Could not steer active turn key=%s: %s", session.key, error)
+                if callback.message:
+                    try:
+                        await callback.message.edit_text(
+                            "⚠️ <b>Не удалось добавить контекст.</b>\n"
+                            "Текущая работа уже могла завершиться — отправьте сообщение снова.",
+                            reply_markup=None,
+                        )
+                    except TelegramAPIError:
+                        await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.answer("Контекст не передан", show_alert=True)
+                return
+            if not accepted:
+                self.busy_inputs.pop(token, None)
+                await callback.answer(
+                    "Текущая работа уже завершилась. Отправьте сообщение снова.",
+                    show_alert=True,
+                )
+                return
+
+            self.busy_inputs.pop(token, None)
+            if callback.message:
+                try:
+                    await callback.message.edit_text(
+                        "🧩 <b>Контекст добавлен в текущую работу.</b>\n"
+                        "Codex продолжает без остановки.",
+                        reply_markup=None,
+                    )
+                except TelegramAPIError:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.answer("Контекст передан")
+            return
+
+        self.busy_inputs.pop(token, None)
 
         interrupt = False
         preparing_task: asyncio.Task[Any] | None = None
@@ -2312,6 +2365,29 @@ class TelegramCodexBot:
             )
         elif not busy:
             await self._drain_queued_inputs(session)
+
+    async def _steer_active_turn(self, session: Session, input_items: list[dict[str, Any]]) -> bool:
+        """Append user context to the in-flight turn without creating a new turn."""
+        async with session.lock:
+            if (
+                not session.thread_id
+                or not session.active_turn_id
+                or session.stopping
+            ):
+                return False
+            thread_id = session.thread_id
+            turn_id = session.active_turn_id
+        await self._rpc(
+            "turn/steer",
+            {
+                "threadId": thread_id,
+                "input": input_items,
+                "expectedTurnId": turn_id,
+            },
+            timeout=10,
+        )
+        log.info("Turn steered key=%s thread=%s turn=%s", session.key, thread_id, turn_id)
+        return True
 
     async def _interrupt_for_queued_input(self, session: Session) -> None:
         async with session.lock:
