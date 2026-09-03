@@ -58,6 +58,7 @@ FULL_ACCESS_STATE_FILE = Path(__file__).with_name(".full-access.json")
 TRUSTED_WRITE_DIRS_STATE_FILE = Path(__file__).with_name(".trusted-write-dirs.json")
 TopicKey = tuple[int, str, int]
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
+MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
 MAX_AUDIO_BYTES = 20 * 1024 * 1024
 MAX_AUDIO_SECONDS = 10 * 60
 MAX_WAV_BYTES = 13 * 1024 * 1024
@@ -459,6 +460,7 @@ class TelegramCodexBot:
             self.on_image_document,
             F.document & F.document.mime_type.startswith("image/"),
         )
+        self.router.message.register(self.on_document, F.document)
         self.router.message.register(self.on_audio, F.voice)
         self.router.message.register(self.on_audio, F.audio)
         self.router.message.register(self.on_message, F.text & ~F.text.startswith("/"))
@@ -1735,6 +1737,46 @@ class TelegramCodexBot:
             mime_type=message.document.mime_type or "image/*",
         )
 
+    async def on_document(self, message: Message) -> None:
+        """Save ordinary Telegram documents into the topic project for Codex."""
+        document = message.document
+        if not document:
+            return
+        session = await self._reserve_preparation(message)
+        if not session:
+            return
+        try:
+            if document.file_size and document.file_size > MAX_DOCUMENT_BYTES:
+                await self._answer(message, "❌ Файл больше 50 МБ.")
+                return
+            await self._send_typing(message)
+            data = await self._download_bytes(document.file_id)
+            if len(data) > MAX_DOCUMENT_BYTES:
+                await self._answer(message, "❌ Файл больше 50 МБ.")
+                return
+            path = self._store_document(session, document.file_name, data)
+            caption = (message.caption or "").strip()
+            prompt = f"Пользователь прислал файл: {path}"
+            if caption:
+                prompt += "\n\nЗадача пользователя:\n" + caption
+            else:
+                prompt += "\n\nПроанализируй файл и выполни задачу пользователя."
+            await self._submit_input(
+                message,
+                [{"type": "text", "text": prompt}],
+                input_chars=len(prompt),
+                reserved=True,
+                media_kind="document",
+            )
+        except (OSError, TelegramAPIError) as error:
+            log.exception("Could not download document key=%s", session.key)
+            await self._answer(
+                message,
+                f"❌ Не удалось обработать файл: <code>{escape(str(error))}</code>",
+            )
+        finally:
+            await self._release_preparation(session)
+
     async def _handle_image(
         self,
         message: Message,
@@ -2075,6 +2117,20 @@ class TelegramCodexBot:
         path.write_bytes(data)
         path.chmod(0o600)
         log.info("Image stored for Codex key=%s bytes=%s", key, len(data))
+        return path
+
+    def _store_document(self, session: Session, filename: str | None, data: bytes) -> Path:
+        project_dir = session.project_dir or self._default_project_dir(session.key)
+        session.project_dir = project_dir
+        uploads = project_dir / "uploads"
+        uploads.mkdir(mode=0o700, parents=True, exist_ok=True)
+        uploads.chmod(0o700)
+        safe_name = Path(filename or "document").name
+        safe_name = re.sub(r"[^\\w.-]+", "_", safe_name).strip("._") or "document"
+        path = uploads / f"{secrets.token_hex(6)}-{safe_name[:120]}"
+        path.write_bytes(data)
+        path.chmod(0o600)
+        log.info("Document stored for Codex key=%s path=%s bytes=%s", session.key, path, len(data))
         return path
 
     async def _to_wav(self, source: bytes) -> bytes:
