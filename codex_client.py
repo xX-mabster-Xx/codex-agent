@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import signal
 from typing import Any
+import tomllib
 
 
 log = logging.getLogger(__name__)
@@ -47,10 +48,13 @@ class CodexClient:
         project_dir: Path,
         proxy_url: str | None = None,
         extra_env: dict[str, str] | None = None,
+        profile: str | None = None,
     ) -> None:
         self.project_dir = project_dir
         self.proxy_url = proxy_url
         self.extra_env = extra_env or {}
+        self.profile = profile
+        self.config_overrides = self._profile_overrides(profile)
         self.events: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
         self.server_requests: asyncio.Queue[ServerRequest] = asyncio.Queue()
         self._item_snapshots: dict[tuple[str, str, str], dict[str, Any]] = {}
@@ -72,9 +76,10 @@ class CodexClient:
 
     async def _start_unlocked(self) -> None:
         log.info(
-            "Starting codex app-server cwd=%s proxy=%s",
+            "Starting codex app-server cwd=%s proxy=%s profile=%s",
             self.project_dir,
             bool(self.proxy_url),
+            self.profile or "default",
         )
         environment = os.environ.copy()
         # These credentials belong exclusively to the Telegram frontend.  Keep
@@ -100,10 +105,16 @@ class CodexClient:
                 current = environment.get(name, "").strip().strip(",")
                 local_hosts = "127.0.0.1,localhost,::1"
                 environment[name] = f"{current},{local_hosts}" if current else local_hosts
+        command = ["codex"]
+        # Current Codex builds deliberately reject `--profile` for
+        # `app-server`, although they accept it for the interactive runtime.
+        # Layer the profile's relevant TOML values through supported `-c`
+        # overrides instead.  The normal user config is still loaded first.
+        for override in self.config_overrides:
+            command.extend(("--config", override))
+        command.extend(("app-server", "--stdio"))
         self._process = await asyncio.create_subprocess_exec(
-            "codex",
-            "app-server",
-            "--stdio",
+            *command,
             cwd=self.project_dir,
             env=environment,
             stdin=asyncio.subprocess.PIPE,
@@ -137,6 +148,52 @@ class CodexClient:
             raise
         self.generation += 1
         log.info("codex app-server initialized")
+
+    @classmethod
+    def _profile_overrides(cls, profile: str | None) -> list[str]:
+        if not profile:
+            return []
+        path = Path.home() / ".codex" / f"{profile}.config.toml"
+        try:
+            with path.open("rb") as source:
+                values = tomllib.load(source)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            raise CodexRPCError(f"Could not load Codex profile {profile!r}: {error}") from error
+        overrides: list[str] = []
+        for name, value in values.items():
+            # These persist UI/project preferences only; forwarding them is
+            # unnecessary for a headless app-server and can leak old model UI
+            # state into the profile.
+            if name in {"tui", "projects"}:
+                continue
+            cls._append_toml_overrides(overrides, name, value)
+        return overrides
+
+    @classmethod
+    def _append_toml_overrides(
+        cls, target: list[str], key: str, value: Any
+    ) -> None:
+        if isinstance(value, dict):
+            for child, child_value in value.items():
+                cls._append_toml_overrides(target, f"{key}.{cls._toml_key(str(child))}", child_value)
+            return
+        target.append(f"{key}={cls._toml_value(value)}")
+
+    @staticmethod
+    def _toml_key(value: str) -> str:
+        return value if value.replace("_", "").isalnum() else json.dumps(value)
+
+    @classmethod
+    def _toml_value(cls, value: Any) -> str:
+        if isinstance(value, str):
+            return json.dumps(value)
+        if isinstance(value, bool):
+            return "true" if value else "false"
+        if isinstance(value, (int, float)):
+            return str(value)
+        if isinstance(value, list):
+            return "[" + ", ".join(cls._toml_value(item) for item in value) + "]"
+        raise CodexRPCError(f"Unsupported Codex profile value: {value!r}")
 
     async def call(
         self, method: str, params: dict[str, Any], timeout: float = 30
