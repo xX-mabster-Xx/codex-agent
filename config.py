@@ -1,9 +1,19 @@
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import re
 from urllib.parse import urlparse
 
 from dotenv import dotenv_values
+
+
+PROTECTED_PROVIDER_ENV = {
+    "BOT_TOKEN",
+    "ROOT_APPROVAL_BOT_TOKEN",
+    "OPENROUTER_API_KEY",
+    "GOOGLE_OAUTH_CLIENT_ID",
+    "GOOGLE_OAUTH_CLIENT_SECRET",
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,6 +31,7 @@ class Config:
     google_oauth_client_secret: str | None = None
     openrouter_api_key: str | None = None
     openrouter_audio_model: str = "google/gemini-3.5-flash-lite"
+    provider_secrets: dict[str, str] | None = None
     log_level: str = "INFO"
     log_file: Path = Path("logs/bot.log")
 
@@ -112,6 +123,16 @@ class Config:
             google_oauth_client_secret=google_oauth_client_secret,
             openrouter_api_key=openrouter_api_key,
             openrouter_audio_model=openrouter_audio_model,
+            # Profiles select the one variable they need.  Keeping this map in
+            # the frontend does not expose it to Codex: bot.py filters it by
+            # the active profile's `env_key` before starting a child process.
+            provider_secrets={
+                name: str(secret)
+                for name, secret in values.items()
+                if re.fullmatch(r"[A-Z_][A-Z0-9_]*", str(name))
+                and secret
+                and name not in PROTECTED_PROVIDER_ENV
+            },
             log_level=log_level,
             log_file=log_file.resolve(),
         )

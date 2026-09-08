@@ -14,8 +14,12 @@ import sys
 import tempfile
 import time
 from typing import Any
+import tomllib
+from urllib.parse import urlparse
 from zoneinfo import ZoneInfo
 
+import aiohttp
+from aiohttp_socks import ProxyConnector
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.default import DefaultBotProperties
 from aiogram.client.session.aiohttp import AiohttpSession
@@ -102,37 +106,87 @@ DEFAULT_NEW_TOPIC_MODEL = "gpt-5.6-luna"
 DEFAULT_PROVIDER = "openai"
 MAX_CONTEXT_LOG_ENTRIES = 18
 MAX_CONTEXT_LOG_CHARS = 18_000
+MODEL_MENU_PAGE_SIZE = 12
+MODEL_DEVELOPER_PAGE_SIZE = 10
 
 
 @dataclass(frozen=True, slots=True)
 class ProviderDefinition:
     label: str
     profile: str | None = None
-    models: tuple["ProviderModel", ...] = ()
+    base_url: str | None = None
+    env_key: str | None = None
+    auth_command: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
-class ProviderModel:
-    model_id: str
-    label: str
-    default: bool = False
-    reasoning_efforts: tuple[str, ...] = ("low", "medium", "high")
+class ModelMenuAction:
+    key: TopicKey
+    provider: str
+    models: tuple[dict[str, Any], ...]
+    developer: str | None = None
+    page: int = 0
+    view: str = "groups"
 
 
-# Adding another provider is deliberately data-only: create its Codex profile
-# in ~/.codex and add its id, title, and profile name here.
-PROVIDERS: dict[str, ProviderDefinition] = {
-    "openai": ProviderDefinition("OpenAI Codex"),
-    "gonka": ProviderDefinition(
-        "Gonka",
-        profile="gonka",
-        models=(
-            ProviderModel("gonka-minimax", "Gonka · MiniMax M2.7"),
-            ProviderModel("gonka-deepseek", "Gonka · DeepSeek V4 Flash", default=True),
-            ProviderModel("gonka-kimi", "Gonka · Kimi K2.6"),
-        ),
-    ),
-}
+def discover_providers(config_dir: Path | None = None) -> dict[str, ProviderDefinition]:
+    """Discover custom Codex providers from their ordinary named profiles."""
+    providers: dict[str, ProviderDefinition] = {
+        DEFAULT_PROVIDER: ProviderDefinition("OpenAI Codex"),
+    }
+    root = config_dir or Path.home() / ".codex"
+    try:
+        profiles = sorted(root.glob("*.config.toml"))
+    except OSError as error:
+        log.warning("Could not inspect Codex profile directory %s: %s", root, error)
+        return providers
+    for path in profiles:
+        try:
+            with path.open("rb") as source:
+                values = tomllib.load(source)
+        except (OSError, tomllib.TOMLDecodeError) as error:
+            log.warning("Ignoring unreadable Codex profile %s: %s", path, error)
+            continue
+        provider_id = values.get("model_provider")
+        profile_name = path.name.removesuffix(".config.toml")
+        definitions = values.get("model_providers")
+        definition = (
+            definitions.get(provider_id)
+            if isinstance(provider_id, str) and isinstance(definitions, dict)
+            else None
+        )
+        if (
+            not isinstance(provider_id, str)
+            or not provider_id
+            or provider_id == DEFAULT_PROVIDER
+            or not isinstance(definition, dict)
+        ):
+            continue
+        if provider_id in providers:
+            log.warning("Ignoring duplicate Codex provider %s from %s", provider_id, path)
+            continue
+        auth = definition.get("auth")
+        command = auth.get("command") if isinstance(auth, dict) else None
+        args = auth.get("args") if isinstance(auth, dict) else None
+        command_parts: tuple[str, ...] = ()
+        if isinstance(command, str) and command.strip():
+            command_parts = (command.strip(),)
+            if isinstance(args, list) and all(isinstance(arg, str) for arg in args):
+                command_parts += tuple(args)
+        base_url = definition.get("base_url")
+        env_key = definition.get("env_key")
+        providers[provider_id] = ProviderDefinition(
+            label=str(definition.get("name") or provider_id),
+            profile=profile_name,
+            base_url=base_url.rstrip("/") if isinstance(base_url, str) else None,
+            env_key=env_key if isinstance(env_key, str) else None,
+            auth_command=command_parts,
+        )
+    return providers
+
+
+# New providers need only a standard `~/.codex/<profile>.config.toml` file.
+PROVIDERS = discover_providers()
 
 TELEGRAM_DEVELOPER_INSTRUCTIONS = """\
 You are communicating with the user through a Telegram bot. Format every
@@ -343,7 +397,10 @@ class TelegramCodexBot:
         }
         self.codex_clients: dict[str, CodexClient] = {
             DEFAULT_PROVIDER: CodexClient(
-                config.project_dir, config.proxy_url, codex_env
+                config.project_dir,
+                config.proxy_url,
+                codex_env,
+                provider_env=self._provider_environment(DEFAULT_PROVIDER),
             )
         }
         # Kept as a compatibility alias for code that only needs the default
@@ -367,6 +424,7 @@ class TelegramCodexBot:
         self.approvals: dict[str, PendingApproval] = {}
         self.busy_inputs: dict[str, PendingBusyInput] = {}
         self.model_choices: dict[str, tuple[TopicKey, str, str, set[str]]] = {}
+        self.model_catalog_actions: dict[str, ModelMenuAction] = {}
         self.effort_choices: dict[str, tuple[TopicKey, str, str]] = {}
         self._forum_icon_ids: dict[str, str] | None = None
         self._codex_rate_limits: dict[str, Any] | None = None
@@ -501,6 +559,9 @@ class TelegramCodexBot:
             self.on_model_selected, F.data.startswith("model:set:")
         )
         self.router.callback_query.register(
+            self.on_model_catalog, F.data.startswith("model:catalog:")
+        )
+        self.router.callback_query.register(
             self.on_effort_menu, F.data == "effort:menu"
         )
         self.router.callback_query.register(
@@ -581,15 +642,25 @@ class TelegramCodexBot:
                     "GOOGLE_OAUTH_CLIENT_SECRET": self.config.google_oauth_client_secret,
                 }.items()
                 if value
-            }
+            } if provider == DEFAULT_PROVIDER else {}
             client = CodexClient(
                 self.config.project_dir,
                 self.config.proxy_url,
                 codex_env,
                 profile=definition.profile,
+                provider_env=self._provider_environment(provider),
             )
             self.codex_clients[provider] = client
         return client
+
+    def _provider_environment(self, provider: str) -> dict[str, str]:
+        """Return only the credential explicitly requested by this profile."""
+        definition = PROVIDERS[provider]
+        if not definition.env_key:
+            return {}
+        secrets_map = self.config.provider_secrets or {}
+        secret = secrets_map.get(definition.env_key)
+        return {definition.env_key: secret} if secret else {}
 
     async def _ensure_provider_started(self, provider: str) -> CodexClient:
         client = self._client(provider)
@@ -1090,11 +1161,50 @@ class TelegramCodexBot:
                 session.initial_model_menu_shown = False
             await self._send_html(key, "Codex не вернул доступных моделей.")
             return
+        self._clear_model_menu_tokens(key)
+        await self._render_model_menu(key, models, for_new_topic=for_new_topic)
+
+    def _clear_model_menu_tokens(self, key: TopicKey) -> None:
         self.model_choices = {
-            token: choice
-            for token, choice in self.model_choices.items()
-            if choice[0] != key
+            token: choice for token, choice in self.model_choices.items() if choice[0] != key
         }
+        self.model_catalog_actions = {
+            token: action
+            for token, action in getattr(self, "model_catalog_actions", {}).items()
+            if action.key != key
+        }
+
+    def _catalog_action_token(self, action: ModelMenuAction) -> str:
+        token = secrets.token_urlsafe(6)
+        if not hasattr(self, "model_catalog_actions"):
+            self.model_catalog_actions = {}
+        self.model_catalog_actions[token] = action
+        return token
+
+    @staticmethod
+    def _model_developer(model: dict[str, Any]) -> str:
+        for field_name in ("owned_by", "owner", "organization", "developer"):
+            value = model.get(field_name)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        model_id = str(model.get("model") or model.get("id") or "").lstrip("~")
+        if "/" in model_id:
+            return model_id.partition("/")[0] or "Other"
+        return "Other"
+
+    async def _render_model_menu(
+        self,
+        key: TopicKey,
+        models: list[dict[str, Any]],
+        *,
+        developer: str | None = None,
+        page: int = 0,
+        view: str = "groups",
+        for_new_topic: bool = False,
+    ) -> None:
+        session = self.sessions.get(key)
+        if not session:
+            return
         current = session.model
         provider_rows: list[InlineKeyboardButton] = []
         for provider, definition in PROVIDERS.items():
@@ -1104,29 +1214,86 @@ class TelegramCodexBot:
                 callback_data=f"provider:set:{provider}",
                 style="success" if selected_provider else "primary",
             ))
-        rows: list[list[InlineKeyboardButton]] = [provider_rows]
-        for model in models[:30]:
-            model_id = str(model.get("model") or model.get("id") or "")
-            if not model_id:
-                continue
-            token = secrets.token_urlsafe(6)
-            self.model_choices[token] = (
-                key,
-                session.provider,
-                model_id,
-                set(self._model_reasoning_efforts(model)),
-            )
-            label = str(model.get("displayName") or model_id)
-            if model.get("isDefault"):
-                label += " · default"
-            selected = current == model_id or (current is None and model.get("isDefault"))
-            rows.append(
-                [InlineKeyboardButton(
+        rows: list[list[InlineKeyboardButton]] = [
+            provider_rows[index:index + 3]
+            for index in range(0, len(provider_rows), 3)
+        ]
+        grouped: dict[str, list[dict[str, Any]]] = {}
+        for model in models:
+            grouped.setdefault(self._model_developer(model), []).append(model)
+        should_group = len(models) > MODEL_MENU_PAGE_SIZE and len(grouped) > 1
+        if should_group and developer is None:
+            developers = sorted(grouped, key=lambda name: (-len(grouped[name]), name.casefold()))
+            total_pages = max(1, (len(developers) + MODEL_DEVELOPER_PAGE_SIZE - 1) // MODEL_DEVELOPER_PAGE_SIZE)
+            page = max(0, min(page, total_pages - 1))
+            start = page * MODEL_DEVELOPER_PAGE_SIZE
+            for name in developers[start:start + MODEL_DEVELOPER_PAGE_SIZE]:
+                token = self._catalog_action_token(ModelMenuAction(
+                    key, session.provider, tuple(models), name, 0, "models"
+                ))
+                rows.append([InlineKeyboardButton(
+                    text=f"{name} · {len(grouped[name])}"[:58],
+                    callback_data=f"model:catalog:{token}",
+                    style="primary",
+                )])
+            navigation: list[InlineKeyboardButton] = []
+            if page:
+                token = self._catalog_action_token(ModelMenuAction(
+                    key, session.provider, tuple(models), None, page - 1, "groups"
+                ))
+                navigation.append(InlineKeyboardButton("←", callback_data=f"model:catalog:{token}"))
+            if page + 1 < total_pages:
+                token = self._catalog_action_token(ModelMenuAction(
+                    key, session.provider, tuple(models), None, page + 1, "groups"
+                ))
+                navigation.append(InlineKeyboardButton("→", callback_data=f"model:catalog:{token}"))
+            if navigation:
+                rows.append(navigation)
+            heading = "Выберите разработчика"
+        else:
+            visible_models = grouped.get(developer, []) if developer else models
+            total_pages = max(1, (len(visible_models) + MODEL_MENU_PAGE_SIZE - 1) // MODEL_MENU_PAGE_SIZE)
+            page = max(0, min(page, total_pages - 1))
+            start = page * MODEL_MENU_PAGE_SIZE
+            for model in visible_models[start:start + MODEL_MENU_PAGE_SIZE]:
+                model_id = str(model.get("model") or model.get("id") or "")
+                if not model_id:
+                    continue
+                token = secrets.token_urlsafe(6)
+                self.model_choices[token] = (
+                    key,
+                    session.provider,
+                    model_id,
+                    set(self._model_reasoning_efforts(model)),
+                )
+                label = str(model.get("displayName") or model_id)
+                if model.get("isDefault"):
+                    label += " · default"
+                selected = current == model_id or (current is None and model.get("isDefault"))
+                rows.append([InlineKeyboardButton(
                     text=("✓ " if selected else "") + label[:58],
                     callback_data=f"model:set:{token}",
                     style="success" if selected else "primary",
-                )]
-            )
+                )])
+            navigation = []
+            if page:
+                token = self._catalog_action_token(ModelMenuAction(
+                    key, session.provider, tuple(models), developer, page - 1, "models"
+                ))
+                navigation.append(InlineKeyboardButton("←", callback_data=f"model:catalog:{token}"))
+            if page + 1 < total_pages:
+                token = self._catalog_action_token(ModelMenuAction(
+                    key, session.provider, tuple(models), developer, page + 1, "models"
+                ))
+                navigation.append(InlineKeyboardButton("→", callback_data=f"model:catalog:{token}"))
+            if developer is not None:
+                token = self._catalog_action_token(ModelMenuAction(
+                    key, session.provider, tuple(models), None, 0, "groups"
+                ))
+                navigation.insert(0, InlineKeyboardButton("Разработчики", callback_data=f"model:catalog:{token}"))
+            if navigation:
+                rows.append(navigation)
+            heading = f"Модели: {developer}" if developer else "Доступные модели"
         rows.append(
             [InlineKeyboardButton(
                 text="🧠 Глубина рассуждений",
@@ -1143,23 +1310,23 @@ class TelegramCodexBot:
             else "🧠 <b>Модель для этого topic</b>\n"
             f"Провайдер: <code>{escape(PROVIDERS[session.provider].label)}</code>\n"
             f"Сейчас: <code>{escape(current or 'рекомендованная по умолчанию')}</code>\n\n"
-            "Сначала выберите провайдера кнопками выше. Модель и thread хранятся "
-            "отдельно для каждого provider в каждом topic."
+            f"{escape(heading)}. Модель и thread хранятся отдельно для каждого provider в каждом topic."
         )
         await self._send_html(key, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
     async def _models_for_provider(self, session: Session) -> list[dict[str, Any]]:
         definition = PROVIDERS[session.provider]
-        if definition.models:
-            return [
-                {
-                    "model": model.model_id,
-                    "displayName": model.label,
-                    "isDefault": model.default,
-                    "supportedReasoningEfforts": list(model.reasoning_efforts),
-                }
-                for model in definition.models
-            ]
+        if definition.base_url:
+            try:
+                return await self._provider_models(definition)
+            except (aiohttp.ClientError, asyncio.TimeoutError, OSError, RuntimeError) as error:
+                log.warning("Could not load model catalog provider=%s: %s", session.provider, error)
+                await self._send_html(
+                    session.key,
+                    "❌ Не удалось получить каталог моделей этого провайдера. "
+                    "Проверьте его профиль и ключ API.",
+                )
+                return []
         try:
             result = await self._rpc(
                 "model/list",
@@ -1174,6 +1341,108 @@ class TelegramCodexBot:
             )
             return []
         return [model for model in result.get("data", []) if not model.get("hidden")]
+
+    async def _provider_models(self, definition: ProviderDefinition) -> list[dict[str, Any]]:
+        """Fetch an OpenAI-compatible provider model catalog without hardcoding it."""
+        assert definition.base_url
+        headers: dict[str, str] = {}
+        if definition.env_key:
+            token = (self.config.provider_secrets or {}).get(definition.env_key)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        elif definition.auth_command:
+            token = await self._provider_auth_token(definition.auth_command)
+            if token:
+                headers["Authorization"] = f"Bearer {token}"
+        url = definition.base_url.rstrip("/") + "/models"
+        data = await self._provider_catalog_request(url, headers, proxy=False)
+        items = data.get("data") or data.get("models") or []
+        if not isinstance(items, list):
+            raise RuntimeError("provider returned an invalid model catalog")
+        models: list[dict[str, Any]] = []
+        for item in items:
+            raw = {"id": item} if isinstance(item, str) else item
+            if not isinstance(raw, dict):
+                continue
+            model_id = str(raw.get("id") or raw.get("model") or raw.get("name") or "")
+            if not model_id:
+                continue
+            models.append({
+                **raw,
+                "model": model_id,
+                "displayName": str(
+                    raw.get("display_name") or raw.get("displayName") or raw.get("name") or model_id
+                ),
+            })
+        return sorted(models, key=lambda model: str(model["displayName"]).casefold())
+
+    async def _provider_catalog_request(
+        self, url: str, headers: dict[str, str], *, proxy: bool
+    ) -> dict[str, Any]:
+        connector: aiohttp.BaseConnector | None = None
+        if proxy:
+            connector = ProxyConnector.from_url(self.config.proxy_url or "")
+        try:
+            async with aiohttp.ClientSession(connector=connector, trust_env=False) as http:
+                async with http.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=20)) as response:
+                    response.raise_for_status()
+                    payload = await response.json(content_type=None)
+        except aiohttp.ClientResponseError as error:
+            # The Nous catalog is occasionally geo-blocked by Cloudflare on a
+            # direct Russian connection.  This is a transport block rather
+            # than an authentication failure; do not proxy ordinary 4xxs.
+            cloudflare_block = error.status == 403 and error.headers.get("Server", "").casefold() == "cloudflare"
+            if not proxy and cloudflare_block and self.config.proxy_url:
+                return await self._provider_catalog_request(url, headers, proxy=True)
+            raise
+        except (aiohttp.ClientConnectionError, aiohttp.ServerTimeoutError, asyncio.TimeoutError, OSError):
+            parsed = urlparse(url)
+            local = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
+            if not proxy and self.config.proxy_url and not local:
+                return await self._provider_catalog_request(url, headers, proxy=True)
+            raise
+        if not isinstance(payload, dict):
+            raise RuntimeError("provider returned a non-object model catalog")
+        return payload
+
+    @staticmethod
+    async def _provider_auth_token(command: tuple[str, ...]) -> str:
+        process = await asyncio.create_subprocess_exec(
+            *command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        try:
+            stdout, _ = await asyncio.wait_for(process.communicate(), timeout=30)
+        except asyncio.TimeoutError:
+            process.kill()
+            await process.communicate()
+            raise RuntimeError("provider credential command timed out")
+        if process.returncode:
+            raise RuntimeError("provider credential command failed")
+        return stdout.decode(errors="replace").strip().splitlines()[-1] if stdout.strip() else ""
+
+    async def on_model_catalog(self, callback: CallbackQuery) -> None:
+        if not callback.data or not isinstance(callback.message, Message):
+            return
+        token = callback.data.removeprefix("model:catalog:")
+        action = self.model_catalog_actions.pop(token, None)
+        if not action:
+            await callback.answer("Список моделей устарел. Откройте /model снова.", show_alert=True)
+            return
+        session = self.sessions.get(action.key)
+        if not session or session.provider != action.provider:
+            await callback.answer("Провайдер уже изменён. Откройте /model снова.", show_alert=True)
+            return
+        try:
+            await callback.message.edit_reply_markup(reply_markup=None)
+        except TelegramAPIError:
+            pass
+        await callback.answer()
+        await self._render_model_menu(
+            action.key, list(action.models), developer=action.developer,
+            page=action.page, view=action.view,
+        )
 
     async def on_model_selected(self, callback: CallbackQuery) -> None:
         if not callback.data:

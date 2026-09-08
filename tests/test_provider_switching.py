@@ -1,7 +1,7 @@
 import asyncio
 from unittest.mock import AsyncMock
 
-from bot import Session, TelegramCodexBot
+from bot import PROVIDERS, Session, TelegramCodexBot
 
 
 def test_provider_switch_restores_each_native_thread() -> None:
@@ -49,17 +49,16 @@ def test_first_provider_turn_gets_topic_continuity_transcript() -> None:
     assert items[1]["text"] == "Implement it."
 
 
-def test_gonka_picker_has_only_gonka_models() -> None:
+def test_custom_provider_picker_uses_its_catalog() -> None:
     bot = object.__new__(TelegramCodexBot)
     session = Session(key=(1, "forum", 2), provider="gonka")
+    bot._provider_models = AsyncMock(return_value=[
+        {"model": "gonka/example", "displayName": "Example"},
+    ])
 
     models = asyncio.run(bot._models_for_provider(session))
 
-    assert [model["model"] for model in models] == [
-        "gonka-minimax",
-        "gonka-deepseek",
-        "gonka-kimi",
-    ]
+    assert [model["model"] for model in models] == ["gonka/example"]
 
 
 def test_model_picker_includes_per_topic_provider_buttons() -> None:
@@ -68,6 +67,10 @@ def test_model_picker_includes_per_topic_provider_buttons() -> None:
     session = Session(key=key, provider="gonka")
     bot.sessions = {key: session}
     bot.model_choices = {}
+    bot.model_catalog_actions = {}
+    bot._provider_models = AsyncMock(return_value=[
+        {"model": "gonka/example", "displayName": "Example"},
+    ])
     bot._send_html = AsyncMock()
 
     asyncio.run(bot._show_model_menu(key))
@@ -75,7 +78,6 @@ def test_model_picker_includes_per_topic_provider_buttons() -> None:
     _, _, keyboard = bot._send_html.await_args.args
     provider_buttons = keyboard.inline_keyboard[0]
     assert [button.callback_data for button in provider_buttons] == [
-        "provider:set:openai",
-        "provider:set:gonka",
+        f"provider:set:{name}" for name in PROVIDERS
     ]
     assert provider_buttons[1].text.startswith("✓ ")

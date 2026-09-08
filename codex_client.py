@@ -49,11 +49,13 @@ class CodexClient:
         proxy_url: str | None = None,
         extra_env: dict[str, str] | None = None,
         profile: str | None = None,
+        provider_env: dict[str, str] | None = None,
     ) -> None:
         self.project_dir = project_dir
         self.proxy_url = proxy_url
         self.extra_env = extra_env or {}
         self.profile = profile
+        self.provider_env = provider_env or {}
         self.config_overrides = self._profile_overrides(profile)
         self.events: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
         self.server_requests: asyncio.Queue[ServerRequest] = asyncio.Queue()
@@ -86,7 +88,12 @@ class CodexClient:
         # them out of every tool and MCP process spawned by Codex.
         environment.pop("BOT_TOKEN", None)
         environment.pop("OPENROUTER_API_KEY", None)
+        environment.pop("GOOGLE_OAUTH_CLIENT_ID", None)
+        environment.pop("GOOGLE_OAUTH_CLIENT_SECRET", None)
         environment.update(self.extra_env)
+        # `provider_env` is assembled from the active profile's declared
+        # `env_key`, never from the complete bot environment.
+        environment.update(self.provider_env)
         if self.proxy_url:
             for name in (
                 "HTTP_PROXY",
