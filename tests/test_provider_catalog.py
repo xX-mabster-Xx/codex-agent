@@ -51,7 +51,7 @@ def test_large_catalog_is_grouped_and_paged() -> None:
     bot._send_html = send_html
     models = [
         {"model": f"developer-{number}/model-{index}", "displayName": f"M {number}-{index}"}
-        for number in range(3)
+        for number in range(11)
         for index in range(MODEL_MENU_PAGE_SIZE)
     ]
 
@@ -59,6 +59,7 @@ def test_large_catalog_is_grouped_and_paged() -> None:
 
     keyboard = sent[0][2]
     assert any("developer-0 · 12" in button.text for row in keyboard.inline_keyboard for button in row)
+    assert any(button.text == "→" for row in keyboard.inline_keyboard for button in row)
     action = next(iter(bot.model_catalog_actions.values()))
     assert isinstance(action, ModelMenuAction)
     assert action.view == "models"

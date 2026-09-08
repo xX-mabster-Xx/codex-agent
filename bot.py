@@ -1241,12 +1241,12 @@ class TelegramCodexBot:
                 token = self._catalog_action_token(ModelMenuAction(
                     key, session.provider, tuple(models), None, page - 1, "groups"
                 ))
-                navigation.append(InlineKeyboardButton("←", callback_data=f"model:catalog:{token}"))
+                navigation.append(InlineKeyboardButton(text="←", callback_data=f"model:catalog:{token}"))
             if page + 1 < total_pages:
                 token = self._catalog_action_token(ModelMenuAction(
                     key, session.provider, tuple(models), None, page + 1, "groups"
                 ))
-                navigation.append(InlineKeyboardButton("→", callback_data=f"model:catalog:{token}"))
+                navigation.append(InlineKeyboardButton(text="→", callback_data=f"model:catalog:{token}"))
             if navigation:
                 rows.append(navigation)
             heading = "Выберите разработчика"
@@ -1280,17 +1280,17 @@ class TelegramCodexBot:
                 token = self._catalog_action_token(ModelMenuAction(
                     key, session.provider, tuple(models), developer, page - 1, "models"
                 ))
-                navigation.append(InlineKeyboardButton("←", callback_data=f"model:catalog:{token}"))
+                navigation.append(InlineKeyboardButton(text="←", callback_data=f"model:catalog:{token}"))
             if page + 1 < total_pages:
                 token = self._catalog_action_token(ModelMenuAction(
                     key, session.provider, tuple(models), developer, page + 1, "models"
                 ))
-                navigation.append(InlineKeyboardButton("→", callback_data=f"model:catalog:{token}"))
+                navigation.append(InlineKeyboardButton(text="→", callback_data=f"model:catalog:{token}"))
             if developer is not None:
                 token = self._catalog_action_token(ModelMenuAction(
                     key, session.provider, tuple(models), None, 0, "groups"
                 ))
-                navigation.insert(0, InlineKeyboardButton("Разработчики", callback_data=f"model:catalog:{token}"))
+                navigation.insert(0, InlineKeyboardButton(text="Разработчики", callback_data=f"model:catalog:{token}"))
             if navigation:
                 rows.append(navigation)
             heading = f"Модели: {developer}" if developer else "Доступные модели"
