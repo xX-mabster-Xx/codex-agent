@@ -60,7 +60,13 @@ def test_large_catalog_is_grouped_and_paged() -> None:
     asyncio.run(bot._render_model_menu(key, models))
 
     keyboard = sent[0][2]
-    assert any("developer-0 · 12" in button.text for row in keyboard.inline_keyboard for button in row)
+    developer_button = next(
+        button
+        for row in keyboard.inline_keyboard
+        for button in row
+        if "developer-0 · 12" in button.text
+    )
+    assert developer_button.style is None
     assert any(button.text == "→" for row in keyboard.inline_keyboard for button in row)
     action = next(iter(bot.model_catalog_actions.values()))
     assert isinstance(action, ModelMenuAction)
@@ -84,6 +90,29 @@ def test_catalog_page_replaces_its_existing_message() -> None:
 
     message.edit_text.assert_awaited_once()
     bot._send_html.assert_not_awaited()
+
+
+def test_selected_model_is_green_and_other_models_are_neutral() -> None:
+    bot = object.__new__(TelegramCodexBot)
+    key = (1, "forum", 2)
+    bot.sessions = {key: Session(key=key, provider="openai", model="selected")}
+    bot.model_choices = {}
+    bot.model_catalog_actions = {}
+    sent = []
+
+    async def send_html(*args):
+        sent.append(args)
+
+    bot._send_html = send_html
+
+    asyncio.run(bot._render_model_menu(key, [
+        {"model": "selected", "displayName": "Selected"},
+        {"model": "other", "displayName": "Other"},
+    ]))
+
+    buttons = [button for row in sent[0][2].inline_keyboard for button in row]
+    assert next(button for button in buttons if "Selected" in button.text).style == "success"
+    assert next(button for button in buttons if "Other" in button.text).style is None
 
 
 def test_provider_catalog_accepts_codex_slug_shape() -> None:

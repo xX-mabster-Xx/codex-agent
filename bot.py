@@ -1291,7 +1291,6 @@ class TelegramCodexBot:
                 rows.append([InlineKeyboardButton(
                     text=f"{name} · {len(grouped[name])}"[:58],
                     callback_data=f"model:catalog:{token}",
-                    style="primary",
                 )])
             navigation: list[InlineKeyboardButton] = []
             if page:
@@ -1333,7 +1332,7 @@ class TelegramCodexBot:
                 rows.append([InlineKeyboardButton(
                     text=("✓ " if selected else "") + label[:58],
                     callback_data=f"model:set:{token}",
-                    style="success" if selected else "primary",
+                    style="success" if selected else None,
                 )])
             navigation = []
             if page:
