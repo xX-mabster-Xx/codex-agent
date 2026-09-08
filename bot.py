@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass, field
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta
 from html import escape
 from io import BytesIO
@@ -1192,6 +1193,39 @@ class TelegramCodexBot:
             return model_id.partition("/")[0] or "Other"
         return "Other"
 
+    @staticmethod
+    def _model_price_label(model: dict[str, Any]) -> str:
+        """Render common OpenAI/OpenRouter-compatible per-token prices."""
+        pricing = model.get("pricing")
+        pricing = pricing if isinstance(pricing, dict) else {}
+        input_price = (
+            pricing.get("prompt") or pricing.get("input")
+            or model.get("input_cost_per_token") or model.get("input_price")
+        )
+        output_price = (
+            pricing.get("completion") or pricing.get("output")
+            or model.get("output_cost_per_token") or model.get("output_price")
+        )
+
+        def per_million(value: Any) -> str | None:
+            try:
+                amount = Decimal(str(value)) * Decimal(1_000_000)
+            except (InvalidOperation, ValueError):
+                return None
+            if amount < 0:
+                return None
+            rendered = f"{amount:.4f}".rstrip("0").rstrip(".")
+            return rendered or "0"
+
+        input_rendered = per_million(input_price) if input_price is not None else None
+        output_rendered = per_million(output_price) if output_price is not None else None
+        if not input_rendered and not output_rendered:
+            return ""
+        currency = pricing.get("currency") or model.get("currency")
+        currency_label = "$" if not currency or str(currency).upper() == "USD" else str(currency)
+        rendered = "/".join(value for value in (input_rendered, output_rendered) if value)
+        return f"{currency_label}/1M: {rendered}"
+
     async def _render_model_menu(
         self,
         key: TopicKey,
@@ -1270,6 +1304,9 @@ class TelegramCodexBot:
                 label = str(model.get("displayName") or model_id)
                 if model.get("isDefault"):
                     label += " · default"
+                price = self._model_price_label(model)
+                if price:
+                    label = f"{label[:max(1, 58 - len(price) - 3)]} · {price}"
                 selected = current == model_id or (current is None and model.get("isDefault"))
                 rows.append([InlineKeyboardButton(
                     text=("✓ " if selected else "") + label[:58],
@@ -1294,7 +1331,7 @@ class TelegramCodexBot:
                 navigation.insert(0, InlineKeyboardButton(text="Разработчики", callback_data=f"model:catalog:{token}"))
             if navigation:
                 rows.append(navigation)
-            heading = f"Модели: {developer}" if developer else "Доступные модели"
+            heading = "Доступные модели"
         rows.append(
             [InlineKeyboardButton(
                 text="🧠 Глубина рассуждений",

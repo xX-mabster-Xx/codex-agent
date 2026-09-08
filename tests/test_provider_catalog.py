@@ -103,3 +103,9 @@ def test_provider_catalog_accepts_codex_slug_shape() -> None:
         "model": "gonka-kimi",
         "displayName": "Gonka · Kimi",
     }]
+
+
+def test_price_label_uses_per_million_input_and_output_tokens() -> None:
+    assert TelegramCodexBot._model_price_label({
+        "pricing": {"prompt": "0.0000006400", "completion": "0.0000012800"},
+    }) == "$/1M: 0.64/1.28"
