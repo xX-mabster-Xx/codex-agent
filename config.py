@@ -10,7 +10,6 @@ from dotenv import dotenv_values
 PROTECTED_PROVIDER_ENV = {
     "BOT_TOKEN",
     "ROOT_APPROVAL_BOT_TOKEN",
-    "OPENROUTER_API_KEY",
     "GOOGLE_OAUTH_CLIENT_ID",
     "GOOGLE_OAUTH_CLIENT_SECRET",
 }
@@ -126,6 +125,9 @@ class Config:
             # Profiles select the one variable they need.  Keeping this map in
             # the frontend does not expose it to Codex: bot.py filters it by
             # the active profile's `env_key` before starting a child process.
+            # OPENROUTER_API_KEY is intentionally included: it can power both
+            # the audio integration and an explicitly configured OpenRouter
+            # model-provider profile.
             provider_secrets={
                 name: str(secret)
                 for name, secret in values.items()

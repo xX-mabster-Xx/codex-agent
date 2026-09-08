@@ -76,7 +76,12 @@ def test_model_picker_includes_per_topic_provider_buttons() -> None:
     asyncio.run(bot._show_model_menu(key))
 
     _, _, keyboard = bot._send_html.await_args.args
-    provider_buttons = keyboard.inline_keyboard[0]
+    provider_buttons = [
+        button
+        for row in keyboard.inline_keyboard
+        for button in row
+        if button.callback_data and button.callback_data.startswith("provider:set:")
+    ]
     assert [button.callback_data for button in provider_buttons] == [
         f"provider:set:{name}" for name in PROVIDERS
     ]
