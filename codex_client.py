@@ -50,13 +50,19 @@ class CodexClient:
         extra_env: dict[str, str] | None = None,
         profile: str | None = None,
         provider_env: dict[str, str] | None = None,
+        runtime_config_overrides: list[str] | None = None,
     ) -> None:
         self.project_dir = project_dir
         self.proxy_url = proxy_url
         self.extra_env = extra_env or {}
         self.profile = profile
         self.provider_env = provider_env or {}
-        self.config_overrides = self._profile_overrides(profile)
+        # Runtime limits belong to the Telegram integration and intentionally
+        # win over a profile's local defaults.
+        self.config_overrides = [
+            *self._profile_overrides(profile),
+            *(runtime_config_overrides or []),
+        ]
         self.events: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue()
         self.server_requests: asyncio.Queue[ServerRequest] = asyncio.Queue()
         self._item_snapshots: dict[tuple[str, str, str], dict[str, Any]] = {}

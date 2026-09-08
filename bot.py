@@ -109,6 +109,13 @@ MAX_CONTEXT_LOG_ENTRIES = 18
 MAX_CONTEXT_LOG_CHARS = 18_000
 MODEL_MENU_PAGE_SIZE = 12
 MODEL_DEVELOPER_PAGE_SIZE = 10
+SUBAGENT_SOURCE_KINDS = (
+    "subAgent",
+    "subAgentReview",
+    "subAgentCompact",
+    "subAgentThreadSpawn",
+    "subAgentOther",
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -378,6 +385,20 @@ class PendingBusyInput:
     queued_input: QueuedInput
 
 
+@dataclass(slots=True)
+class SubagentState:
+    """A native Codex child thread routed back to its parent Telegram topic."""
+
+    thread_id: str
+    key: TopicKey
+    provider: str
+    root_thread_id: str
+    label: str
+    status: str = "working"
+    active_turn_id: str | None = None
+    created_at: float = field(default_factory=time.monotonic)
+
+
 class TelegramCodexBot:
     def __init__(self, config: Config) -> None:
         self.config = config
@@ -402,6 +423,7 @@ class TelegramCodexBot:
                 config.proxy_url,
                 codex_env,
                 provider_env=self._provider_environment(DEFAULT_PROVIDER),
+                runtime_config_overrides=self._subagent_config_overrides(),
             )
         }
         # Kept as a compatibility alias for code that only needs the default
@@ -422,6 +444,10 @@ class TelegramCodexBot:
         self._memory_prompt_context_loaded = False
         self.thread_to_key: dict[str, TopicKey] = {}
         self.thread_provider: dict[str, str] = {}
+        self.subagents: dict[str, SubagentState] = {}
+        self.subagent_status_messages: dict[tuple[TopicKey, str, str], int] = {}
+        self.subagent_status_updated_at: dict[tuple[TopicKey, str, str], float] = {}
+        self.subagent_stop_actions: dict[str, tuple[TopicKey, str, str]] = {}
         self.approvals: dict[str, PendingApproval] = {}
         self.busy_inputs: dict[str, PendingBusyInput] = {}
         self.model_choices: dict[str, tuple[TopicKey, str, str, set[str]]] = {}
@@ -506,6 +532,7 @@ class TelegramCodexBot:
                 BotCommand(command="reasoning", description="Алиас глубины рассуждений"),
                 BotCommand(command="new", description="Новый Codex thread"),
                 BotCommand(command="stop", description="Остановить текущий turn"),
+                BotCommand(command="agents", description="Статус subagents"),
                 BotCommand(command="fullaccess", description="Временный полный доступ"),
                 BotCommand(command="trustedpath", description="Доверенные папки для записи"),
                 BotCommand(command="remind", description="Создать напоминание"),
@@ -532,6 +559,7 @@ class TelegramCodexBot:
         self.router.message.register(self.on_effort, Command(commands=["effort", "reasoning"]))
         self.router.message.register(self.on_new, Command("new"))
         self.router.message.register(self.on_stop, Command("stop"))
+        self.router.message.register(self.on_agents, Command("agents"))
         self.router.message.register(self.on_full_access, Command("fullaccess"))
         self.router.message.register(self.on_trusted_path, Command("trustedpath"))
         self.router.message.register(self.on_remind, Command("remind"))
@@ -570,6 +598,9 @@ class TelegramCodexBot:
         )
         self.router.callback_query.register(
             self.on_approval, F.data.startswith("approval:")
+        )
+        self.router.callback_query.register(
+            self.on_subagents_stop, F.data.startswith("agents:stop:")
         )
         self.router.callback_query.register(
             self.on_approval_full_access, F.data.startswith("approval_full:")
@@ -650,6 +681,7 @@ class TelegramCodexBot:
                 codex_env,
                 profile=definition.profile,
                 provider_env=self._provider_environment(provider),
+                runtime_config_overrides=self._subagent_config_overrides(),
             )
             self.codex_clients[provider] = client
         return client
@@ -662,6 +694,14 @@ class TelegramCodexBot:
         secrets_map = self.config.provider_secrets or {}
         secret = secrets_map.get(definition.env_key)
         return {definition.env_key: secret} if secret else {}
+
+    def _subagent_config_overrides(self) -> list[str]:
+        """Keep the child-thread limit consistent across every provider profile."""
+        return [
+            "agents.enabled=" + ("true" if self.config.subagents_enabled else "false"),
+            "agents.max_concurrent_threads_per_session="
+            + str(self.config.subagents_max_concurrent),
+        ]
 
     async def _ensure_provider_started(self, provider: str) -> CodexClient:
         client = self._client(provider)
@@ -687,9 +727,131 @@ class TelegramCodexBot:
         if thread_id:
             self.thread_to_key.pop(thread_id, None)
             self.thread_provider.pop(thread_id, None)
+            self._clear_subagents(root_thread_id=thread_id)
 
     def _provider_for_thread(self, thread_id: str) -> str | None:
         return getattr(self, "thread_provider", {}).get(thread_id)
+
+    def _clear_subagents(
+        self, *, provider: str | None = None, root_thread_id: str | None = None
+    ) -> None:
+        """Forget ephemeral child-thread state after a root closes or restarts."""
+        children = [
+            state
+            for state in getattr(self, "subagents", {}).values()
+            if (provider is None or state.provider == provider)
+            and (root_thread_id is None or state.root_thread_id == root_thread_id)
+        ]
+        for state in children:
+            self.subagents.pop(state.thread_id, None)
+            self.thread_to_key.pop(state.thread_id, None)
+            self.thread_provider.pop(state.thread_id, None)
+        if not children:
+            return
+        affected = {(state.key, state.provider, state.root_thread_id) for state in children}
+        for identity in affected:
+            self.subagent_status_messages.pop(identity, None)
+            self.subagent_status_updated_at.pop(identity, None)
+        self.subagent_stop_actions = {
+            token: identity
+            for token, identity in self.subagent_stop_actions.items()
+            if identity not in affected
+        }
+
+    @staticmethod
+    def _subagent_label(thread: dict[str, Any], ordinal: int) -> str:
+        label = thread.get("name") or thread.get("title") or thread.get("preview")
+        if isinstance(label, str) and label.strip():
+            return label.strip().splitlines()[0][:80]
+        return f"Subagent {ordinal}"
+
+    def _register_subagent(
+        self,
+        *,
+        thread: dict[str, Any],
+        key: TopicKey,
+        provider: str,
+        root_thread_id: str,
+    ) -> SubagentState | None:
+        thread_id = str(thread.get("id") or thread.get("threadId") or "")
+        if not thread_id or thread_id == root_thread_id:
+            return None
+        existing = self.subagents.get(thread_id)
+        if existing:
+            return existing
+        ordinal = 1 + sum(
+            state.key == key and state.provider == provider and state.root_thread_id == root_thread_id
+            for state in self.subagents.values()
+        )
+        state = SubagentState(
+            thread_id=thread_id,
+            key=key,
+            provider=provider,
+            root_thread_id=root_thread_id,
+            label=self._subagent_label(thread, ordinal),
+        )
+        self.subagents[thread_id] = state
+        self._bind_thread(thread_id, key, provider)
+        log.info(
+            "Subagent discovered key=%s provider=%s root=%s child=%s label=%r",
+            key,
+            provider,
+            root_thread_id,
+            thread_id,
+            state.label,
+        )
+        return state
+
+    async def _resolve_subagent_thread(
+        self, provider: str, thread_id: str | None
+    ) -> TopicKey | None:
+        """Map an unknown app-server thread to an active root via ancestry."""
+        if not thread_id:
+            return None
+        known = self.thread_to_key.get(thread_id)
+        if known and self._provider_for_thread(thread_id) == provider:
+            return known
+        roots = [
+            (candidate, key)
+            for candidate, key in self.thread_to_key.items()
+            if self._provider_for_thread(candidate) == provider
+            and candidate not in self.subagents
+        ]
+        for root_thread_id, key in roots:
+            try:
+                result = await self._rpc(
+                    "thread/list",
+                    {
+                        "ancestorThreadId": root_thread_id,
+                        "sourceKinds": list(SUBAGENT_SOURCE_KINDS),
+                        "limit": 100,
+                    },
+                    provider=provider,
+                    timeout=5,
+                )
+            except CodexRPCError as error:
+                log.debug(
+                    "Could not resolve child thread=%s under root=%s: %s",
+                    thread_id,
+                    root_thread_id,
+                    error,
+                )
+                continue
+            children = result.get("data") if isinstance(result, dict) else None
+            if not isinstance(children, list):
+                continue
+            for child in children:
+                if not isinstance(child, dict):
+                    continue
+                state = self._register_subagent(
+                    thread=child,
+                    key=key,
+                    provider=provider,
+                    root_thread_id=root_thread_id,
+                )
+                if state and state.thread_id == thread_id:
+                    return key
+        return None
 
     async def _sync_codex_generation(self, provider: str = DEFAULT_PROVIDER) -> bool:
         async with self._recovery_lock:
@@ -709,6 +871,7 @@ class TelegramCodexBot:
                 for thread_id, owner in self.thread_provider.items()
                 if owner != provider
             }
+            self._clear_subagents(provider=provider)
             interrupted_keys = [
                 session.key
                 for session in self.sessions.values()
@@ -1901,6 +2064,159 @@ class TelegramCodexBot:
             message, "✨ Для этого чата/topic создана новая Codex-сессия."
         )
 
+    @staticmethod
+    def _subagent_status_label(status: str) -> str:
+        normalized = status.casefold().replace("_", "")
+        if normalized in {"working", "running", "started", "inprogress", "pending"}:
+            return "⏳ работает"
+        if normalized in {"stopping", "interrupting"}:
+            return "⏹ останавливается"
+        if normalized in {"completed", "success", "succeeded"}:
+            return "✅ завершён"
+        if normalized in {"interrupted", "cancelled", "canceled"}:
+            return "⏹ остановлен"
+        return "❌ " + status[:50]
+
+    @staticmethod
+    def _subagent_is_active(state: SubagentState) -> bool:
+        return state.status.casefold().replace("_", "") in {
+            "working", "running", "started", "inprogress", "pending", "stopping", "interrupting",
+        }
+
+    def _subagents_for(
+        self, key: TopicKey, provider: str, root_thread_id: str | None
+    ) -> list[SubagentState]:
+        if not root_thread_id:
+            return []
+        return sorted(
+            (
+                state
+                for state in self.subagents.values()
+                if state.key == key
+                and state.provider == provider
+                and state.root_thread_id == root_thread_id
+            ),
+            key=lambda state: state.created_at,
+        )
+
+    def _subagent_status_text(self, states: list[SubagentState]) -> str:
+        active = sum(self._subagent_is_active(state) for state in states)
+        completed = sum(state.status == "completed" for state in states)
+        failed = len(states) - active - completed
+        overview = []
+        if active:
+            overview.append(f"⏳ {active} работают")
+        if completed:
+            overview.append(f"✅ {completed} завершены")
+        if failed:
+            overview.append(f"❌ {failed} остановлены/с ошибкой")
+        lines = ["🔀 <b>Subagents</b>", " · ".join(overview) or "Нет активных subagents."]
+        for state in states[:8]:
+            lines.append(
+                f"• <b>{escape(state.label[:80])}</b> — {self._subagent_status_label(state.status)}"
+            )
+        if len(states) > 8:
+            lines.append(f"• ещё {len(states) - 8}")
+        return "\n".join(lines)
+
+    async def _update_subagent_status(
+        self,
+        key: TopicKey,
+        provider: str,
+        root_thread_id: str,
+        *,
+        force: bool = False,
+    ) -> None:
+        states = self._subagents_for(key, provider, root_thread_id)
+        if not states:
+            return
+        identity = (key, provider, root_thread_id)
+        now = time.monotonic()
+        if not force and now - self.subagent_status_updated_at.get(identity, 0.0) < 0.5:
+            return
+        text = self._subagent_status_text(states)
+        message_id = self.subagent_status_messages.get(identity)
+        if message_id and await self._edit_html(key, message_id, text):
+            self.subagent_status_updated_at[identity] = now
+            return
+        sent = await self._send_html(key, text)
+        self.subagent_status_messages[identity] = sent.message_id
+        self.subagent_status_updated_at[identity] = now
+
+    async def on_agents(self, message: Message) -> None:
+        session = self._session(message)
+        states = self._subagents_for(session.key, session.provider, session.thread_id)
+        if not states:
+            await self._answer(message, "🔀 В этом topic нет subagents для текущего Codex thread.")
+            return
+        rows: list[list[InlineKeyboardButton]] = []
+        if any(self._subagent_is_active(state) for state in states):
+            token = secrets.token_urlsafe(8)
+            self.subagent_stop_actions[token] = (
+                session.key,
+                session.provider,
+                session.thread_id or "",
+            )
+            rows.append([InlineKeyboardButton(
+                text="⏹ Остановить subagents",
+                callback_data=f"agents:stop:{token}",
+                style="danger",
+            )])
+        await self._answer(
+            message,
+            self._subagent_status_text(states),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
+        )
+
+    async def _stop_subagents(
+        self, key: TopicKey, provider: str, root_thread_id: str
+    ) -> int:
+        states = [
+            state for state in self._subagents_for(key, provider, root_thread_id)
+            if self._subagent_is_active(state) and state.active_turn_id
+        ]
+        for state in states:
+            state.status = "stopping"
+            await self._cancel_approvals(state.thread_id, provider)
+        if states:
+            await self._update_subagent_status(key, provider, root_thread_id, force=True)
+        results = await asyncio.gather(
+            *(
+                self._rpc(
+                    "turn/interrupt",
+                    {"threadId": state.thread_id, "turnId": state.active_turn_id},
+                    provider=provider,
+                    timeout=8,
+                )
+                for state in states
+            ),
+            return_exceptions=True,
+        )
+        stopped = 0
+        for state, result in zip(states, results, strict=True):
+            if isinstance(result, Exception):
+                state.status = "failed"
+                log.warning("Could not interrupt subagent thread=%s: %s", state.thread_id, result)
+            else:
+                stopped += 1
+        if states:
+            await self._update_subagent_status(key, provider, root_thread_id, force=True)
+        return stopped
+
+    async def on_subagents_stop(self, callback: CallbackQuery) -> None:
+        if not callback.data:
+            return
+        token = callback.data.removeprefix("agents:stop:")
+        action = self.subagent_stop_actions.pop(token, None)
+        if not action:
+            await callback.answer("Список subagents устарел. Откройте /agents снова.", show_alert=True)
+            return
+        key, provider, root_thread_id = action
+        stopped = await self._stop_subagents(key, provider, root_thread_id)
+        await callback.answer(
+            f"Отправлена остановка: {stopped}" if stopped else "Нет активных subagents"
+        )
+
     async def on_stop(self, message: Message) -> None:
         session = self._session(message)
         async with session.lock:
@@ -1932,6 +2248,7 @@ class TelegramCodexBot:
             thread_id,
             turn_id,
         )
+        await self._stop_subagents(session.key, session.provider, thread_id)
         await self._cancel_approvals(thread_id, session.provider)
         recovered = False
         try:
@@ -2526,6 +2843,8 @@ class TelegramCodexBot:
             if session.active_turn_id or session.preparing:
                 return False
             try:
+                if session.thread_id:
+                    self._clear_subagents(root_thread_id=session.thread_id)
                 await self._send_typing_key(session.key)
                 result = await self._start_user_turn(session, queued_input.input_items)
                 turn_id = result["turn"]["id"]
@@ -3218,13 +3537,22 @@ class TelegramCodexBot:
                 limits = info.get("rate_limits") or info.get("rateLimits")
             if isinstance(limits, dict):
                 self._codex_rate_limits = limits
-        thread_id = params.get("threadId")
+        thread_id = self._event_thread_id(params)
         key = self.thread_to_key.get(thread_id)
+        if not key:
+            key = await self._resolve_subagent_thread(provider, thread_id)
         session = self.sessions.get(key) if key else None
         if not session or self._provider_for_thread(str(thread_id)) != provider:
             return
 
-        turn_id = params.get("turnId") or params.get("turn", {}).get("id")
+        subagent = self.subagents.get(str(thread_id))
+        if subagent:
+            await self._handle_subagent_event(subagent, method, params)
+            return
+
+        turn = params.get("turn")
+        turn = turn if isinstance(turn, dict) else {}
+        turn_id = params.get("turnId") or turn.get("id")
         if method == "item/agentMessage/delta":
             summary = session.turns.setdefault(turn_id, TurnSummary())
             item_id = params.get("itemId", "agent")
@@ -3287,6 +3615,52 @@ class TelegramCodexBot:
             )
             await self._finish_turn(key, turn.get("status", "completed"), summary)
             await self._drain_queued_inputs(session)
+
+    @staticmethod
+    def _event_thread_id(params: dict[str, Any]) -> str | None:
+        raw_thread_id = params.get("threadId")
+        if raw_thread_id:
+            return str(raw_thread_id)
+        thread = params.get("thread")
+        if isinstance(thread, dict) and thread.get("id"):
+            return str(thread["id"])
+        return None
+
+    async def _handle_subagent_event(
+        self, state: SubagentState, method: str, params: dict[str, Any]
+    ) -> None:
+        """Track child lifecycle without leaking its noisy item stream to Telegram."""
+        changed = False
+        turn = params.get("turn")
+        turn = turn if isinstance(turn, dict) else {}
+        turn_id = params.get("turnId") or turn.get("id")
+        if method in {"thread/started", "turn/started"}:
+            if turn_id and state.active_turn_id != str(turn_id):
+                state.active_turn_id = str(turn_id)
+                changed = True
+            if state.status != "working":
+                state.status = "working"
+                changed = True
+            changed = changed or method == "thread/started"
+        elif method == "thread/status/changed":
+            status = params.get("status")
+            status_type = status.get("type") if isinstance(status, dict) else status
+            if str(status_type).casefold() == "active" and state.status != "working":
+                state.status = "working"
+                changed = True
+        elif method == "error" and not params.get("willRetry"):
+            state.status = "failed"
+            state.active_turn_id = None
+            changed = True
+        elif method == "turn/completed":
+            status = str(turn.get("status") or "completed")
+            state.status = status
+            state.active_turn_id = None
+            changed = True
+        if changed:
+            await self._update_subagent_status(
+                state.key, state.provider, state.root_thread_id, force=True
+            )
 
     @staticmethod
     def _turn_completion_error(params: dict[str, Any], turn: dict[str, Any]) -> str:
@@ -3519,6 +3893,7 @@ class TelegramCodexBot:
         if request.method not in {
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
             "item/tool/requestUserInput",
             "mcpServer/elicitation/request",
         }:
@@ -3527,7 +3902,10 @@ class TelegramCodexBot:
             )
             return
 
-        key = self.thread_to_key.get(request.params.get("threadId"))
+        thread_id = self._event_thread_id(request.params)
+        key = self.thread_to_key.get(thread_id)
+        if not key:
+            key = await self._resolve_subagent_thread(provider, thread_id)
         if not key:
             await client.respond(
                 request.id, self._approval_response(request, False)
@@ -3655,6 +4033,7 @@ class TelegramCodexBot:
         if request.method in {
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
         } or is_mcp_tool_approval:
             keyboard_rows.append(
                 [
@@ -3723,6 +4102,7 @@ class TelegramCodexBot:
 
     def _approval_text(self, provider: str, request: ServerRequest) -> str:
         params = request.params
+        subagent = self.subagents.get(str(self._event_thread_id(params)))
         if request.method == "item/commandExecution/requestApproval":
             title = "Codex просит выполнить команду"
             details = params.get("command") or "Команда не указана"
@@ -3738,6 +4118,16 @@ class TelegramCodexBot:
                 reason=params.get("reason"),
                 grant_root=params.get("grantRoot"),
             )
+        elif request.method == "item/permissions/requestApproval":
+            title = "Codex просит дополнительные разрешения"
+            details = str(params.get("reason") or "Запрошены права для выполнения задачи.")
+            if params.get("cwd"):
+                details += f"\n\ncwd: {params['cwd']}"
+            requested = params.get("permissions")
+            if requested:
+                details += "\n\nЗапрошено:\n" + json.dumps(
+                    requested, ensure_ascii=False, default=str
+                )[:1800]
         elif request.method == "item/tool/requestUserInput":
             title = "MCP просит разрешить действие с записью"
             tool = self._mcp_tool_label(request)
@@ -3777,8 +4167,12 @@ class TelegramCodexBot:
             details = f"Сервер: {server}\n\n{message}"
         if params.get("reason") and request.method.endswith("commandExecution/requestApproval"):
             details += f"\n\nПричина: {params['reason']}"
+        subagent_line = (
+            f"\n🧩 <b>Subagent:</b> {escape(subagent.label)}"
+            if subagent else ""
+        )
         return (
-            f"⚠️ <b>{escape(title)}</b>\n"
+            f"⚠️ <b>{escape(title)}</b>{subagent_line}\n"
             f"<blockquote expandable>{escape(str(details)[:3000])}</blockquote>"
         )
 
@@ -4067,6 +4461,11 @@ class TelegramCodexBot:
                 choice = cls._approval_choice(question.get("options") or [], allowed)
                 answers[question_id] = {"answers": [choice]}
             return {"answers": answers}
+        if request.method == "item/permissions/requestApproval":
+            return {
+                "permissions": request.params.get("permissions", []) if allowed else [],
+                "scope": "turn",
+            }
         if request.method == "mcpServer/elicitation/request":
             return {"action": "cancel" if cancel else "accept" if allowed else "decline"}
         return {"decision": "cancel" if cancel else "accept" if allowed else "decline"}
@@ -4359,6 +4758,7 @@ class TelegramCodexBot:
         return request.method in {
             "item/commandExecution/requestApproval",
             "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
             "item/tool/requestUserInput",
         } or self._is_mcp_tool_approval(request)
 

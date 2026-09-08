@@ -31,6 +31,8 @@ class Config:
     openrouter_api_key: str | None = None
     openrouter_audio_model: str = "google/gemini-3.5-flash-lite"
     provider_secrets: dict[str, str] | None = None
+    subagents_enabled: bool = True
+    subagents_max_concurrent: int = 3
     log_level: str = "INFO"
     log_file: Path = Path("logs/bot.log")
 
@@ -61,6 +63,16 @@ class Config:
         openrouter_audio_model = value(
             "OPENROUTER_AUDIO_MODEL", "google/gemini-3.5-flash-lite"
         )
+        subagents_enabled_raw = value("SUBAGENTS_ENABLED", "true").casefold()
+        if subagents_enabled_raw not in {"true", "false", "1", "0", "yes", "no"}:
+            raise RuntimeError("SUBAGENTS_ENABLED must be true or false")
+        subagents_enabled = subagents_enabled_raw in {"true", "1", "yes"}
+        try:
+            subagents_max_concurrent = int(value("SUBAGENTS_MAX_CONCURRENT", "3"))
+        except ValueError as error:
+            raise RuntimeError("SUBAGENTS_MAX_CONCURRENT must be an integer") from error
+        if not 1 <= subagents_max_concurrent <= 8:
+            raise RuntimeError("SUBAGENTS_MAX_CONCURRENT must be between 1 and 8")
         log_level = value("LOG_LEVEL", "INFO").upper()
         log_file = Path(value("LOG_FILE", "logs/bot.log")).expanduser()
 
@@ -135,6 +147,8 @@ class Config:
                 and secret
                 and name not in PROTECTED_PROVIDER_ENV
             },
+            subagents_enabled=subagents_enabled,
+            subagents_max_concurrent=subagents_max_concurrent,
             log_level=log_level,
             log_file=log_file.resolve(),
         )
