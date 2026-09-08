@@ -1,4 +1,6 @@
 import asyncio
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from bot import (
     MODEL_MENU_PAGE_SIZE,
@@ -63,3 +65,22 @@ def test_large_catalog_is_grouped_and_paged() -> None:
     action = next(iter(bot.model_catalog_actions.values()))
     assert isinstance(action, ModelMenuAction)
     assert action.view == "models"
+
+
+def test_catalog_page_replaces_its_existing_message() -> None:
+    bot = object.__new__(TelegramCodexBot)
+    key = (1, "forum", 2)
+    bot.sessions = {key: Session(key=key, provider="openai")}
+    bot.model_choices = {}
+    bot.model_catalog_actions = {}
+    bot._send_html = AsyncMock()
+    message = SimpleNamespace(edit_text=AsyncMock())
+
+    asyncio.run(bot._render_model_menu(
+        key,
+        [{"model": "developer/model", "displayName": "Model"}],
+        replace_message=message,
+    ))
+
+    message.edit_text.assert_awaited_once()
+    bot._send_html.assert_not_awaited()

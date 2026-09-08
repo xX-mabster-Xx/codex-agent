@@ -1201,6 +1201,7 @@ class TelegramCodexBot:
         page: int = 0,
         view: str = "groups",
         for_new_topic: bool = False,
+        replace_message: Message | None = None,
     ) -> None:
         session = self.sessions.get(key)
         if not session:
@@ -1312,7 +1313,18 @@ class TelegramCodexBot:
             f"Сейчас: <code>{escape(current or 'рекомендованная по умолчанию')}</code>\n\n"
             f"{escape(heading)}. Модель и thread хранятся отдельно для каждого provider в каждом topic."
         )
-        await self._send_html(key, text, InlineKeyboardMarkup(inline_keyboard=rows))
+        keyboard = InlineKeyboardMarkup(inline_keyboard=rows)
+        if replace_message is not None:
+            try:
+                await replace_message.edit_text(
+                    text,
+                    reply_markup=keyboard,
+                    link_preview_options={"is_disabled": True},
+                )
+                return
+            except TelegramAPIError as error:
+                log.warning("Could not update model menu in place: %s", error)
+        await self._send_html(key, text, keyboard)
 
     async def _models_for_provider(self, session: Session) -> list[dict[str, Any]]:
         definition = PROVIDERS[session.provider]
@@ -1434,14 +1446,11 @@ class TelegramCodexBot:
         if not session or session.provider != action.provider:
             await callback.answer("Провайдер уже изменён. Откройте /model снова.", show_alert=True)
             return
-        try:
-            await callback.message.edit_reply_markup(reply_markup=None)
-        except TelegramAPIError:
-            pass
         await callback.answer()
+        self._clear_model_menu_tokens(action.key)
         await self._render_model_menu(
             action.key, list(action.models), developer=action.developer,
-            page=action.page, view=action.view,
+            page=action.page, view=action.view, replace_message=callback.message,
         )
 
     async def on_model_selected(self, callback: CallbackQuery) -> None:
