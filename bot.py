@@ -1376,7 +1376,9 @@ class TelegramCodexBot:
             raw = {"id": item} if isinstance(item, str) else item
             if not isinstance(raw, dict):
                 continue
-            model_id = str(raw.get("id") or raw.get("model") or raw.get("name") or "")
+            model_id = str(
+                raw.get("id") or raw.get("model") or raw.get("slug") or raw.get("name") or ""
+            )
             if not model_id:
                 continue
             models.append({

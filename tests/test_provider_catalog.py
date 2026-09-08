@@ -84,3 +84,22 @@ def test_catalog_page_replaces_its_existing_message() -> None:
 
     message.edit_text.assert_awaited_once()
     bot._send_html.assert_not_awaited()
+
+
+def test_provider_catalog_accepts_codex_slug_shape() -> None:
+    bot = object.__new__(TelegramCodexBot)
+    bot.config = SimpleNamespace(provider_secrets={}, proxy_url=None)
+    bot._provider_catalog_request = AsyncMock(return_value={
+        "models": [{"slug": "gonka-kimi", "display_name": "Gonka · Kimi"}],
+    })
+
+    models = asyncio.run(bot._provider_models(ProviderDefinition(
+        label="Gonka", base_url="http://127.0.0.1:4011/v1",
+    )))
+
+    assert models == [{
+        "slug": "gonka-kimi",
+        "display_name": "Gonka · Kimi",
+        "model": "gonka-kimi",
+        "displayName": "Gonka · Kimi",
+    }]
