@@ -105,6 +105,46 @@ def test_provider_catalog_accepts_codex_slug_shape() -> None:
     }]
 
 
+def test_provider_catalog_filters_explicitly_incompatible_capabilities() -> None:
+    bot = object.__new__(TelegramCodexBot)
+    bot.config = SimpleNamespace(provider_secrets={}, proxy_url=None)
+    bot._provider_catalog_request = AsyncMock(return_value={
+        "data": [
+            {
+                "id": "openai/gpt-5.6-luna",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "supported_parameters": ["tools", "temperature"],
+            },
+            {
+                "id": "openai/gpt-5.6-luna:batch",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "supported_parameters": ["tools"],
+            },
+            {
+                "id": "openai/gpt-audio",
+                "architecture": {"input_modalities": ["audio", "text"], "output_modalities": ["text", "audio"]},
+                "supported_parameters": ["tools"],
+            },
+            {
+                "id": "plain-text-without-tools",
+                "architecture": {"input_modalities": ["text"], "output_modalities": ["text"]},
+                "supported_parameters": ["temperature"],
+            },
+            # A legacy provider with no capability metadata remains visible.
+            {"id": "unknown-capabilities"},
+        ],
+    })
+
+    models = asyncio.run(bot._provider_models(ProviderDefinition(
+        label="Example", base_url="http://127.0.0.1:4011/v1",
+    )))
+
+    assert [model["model"] for model in models] == [
+        "openai/gpt-5.6-luna",
+        "unknown-capabilities",
+    ]
+
+
 def test_price_label_uses_per_million_input_and_output_tokens() -> None:
     assert TelegramCodexBot._model_price_label({
         "pricing": {"prompt": "0.0000006400", "completion": "0.0000012800"},

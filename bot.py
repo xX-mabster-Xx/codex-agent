@@ -1440,14 +1440,56 @@ class TelegramCodexBot:
             )
             if not model_id:
                 continue
-            models.append({
+            model = {
                 **raw,
                 "model": model_id,
                 "displayName": str(
                     raw.get("display_name") or raw.get("displayName") or raw.get("name") or model_id
                 ),
-            })
+            }
+            if self._is_compatible_catalog_model(model):
+                models.append(model)
         return sorted(models, key=lambda model: str(model["displayName"]).casefold())
+
+    @staticmethod
+    def _is_compatible_catalog_model(model: dict[str, Any]) -> bool:
+        """Keep catalog entries that can plausibly serve a text/tool Codex turn.
+
+        Providers expose different metadata, so an omitted field means
+        "unknown", not "unsupported".  Explicit capabilities are respected;
+        this avoids hiding a provider's otherwise usable legacy catalog.
+        """
+        model_id = str(model.get("model") or model.get("id") or "")
+        display_name = str(model.get("displayName") or model.get("name") or "")
+        batch_marker = re.compile(r"(?:^|[:/_\-\s])batch(?:$|[:/_\-\s])", re.I)
+        if batch_marker.search(model_id) or "(batch)" in display_name.casefold():
+            return False
+
+        architecture = model.get("architecture")
+        architecture = architecture if isinstance(architecture, dict) else {}
+
+        def modalities(*names: str) -> set[str] | None:
+            values: list[Any] = []
+            for name in names:
+                value = architecture.get(name, model.get(name))
+                if value is not None:
+                    values.extend(value if isinstance(value, list) else [value])
+            if not values:
+                return None
+            return {str(value).strip().casefold() for value in values if str(value).strip()}
+
+        input_modalities = modalities("input_modalities")
+        output_modalities = modalities("output_modalities")
+        for available in (input_modalities, output_modalities):
+            if available is not None and ("text" not in available or "audio" in available):
+                return False
+
+        parameters = model.get("supported_parameters")
+        if isinstance(parameters, list) and parameters:
+            supported = {str(parameter).casefold() for parameter in parameters}
+            if "tools" not in supported:
+                return False
+        return True
 
     async def _provider_catalog_request(
         self, url: str, headers: dict[str, str], *, proxy: bool
