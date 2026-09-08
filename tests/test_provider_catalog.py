@@ -108,4 +108,19 @@ def test_provider_catalog_accepts_codex_slug_shape() -> None:
 def test_price_label_uses_per_million_input_and_output_tokens() -> None:
     assert TelegramCodexBot._model_price_label({
         "pricing": {"prompt": "0.0000006400", "completion": "0.0000012800"},
-    }) == "$/1M: 0.64/1.28"
+    }) == "0.64/1.28 $/1M"
+
+
+def test_button_label_removes_only_a_matching_leading_developer() -> None:
+    assert TelegramCodexBot._model_button_label({
+        "model": "openai/gpt-5.6",
+        "displayName": "OpenAI: GPT-5.6",
+    }) == "GPT-5.6"
+    assert TelegramCodexBot._model_button_label({
+        "model": "mistral/large",
+        "displayName": "Mistral Large",
+    }) == "Large"
+    assert TelegramCodexBot._model_button_label({
+        "model": "openai/gpt-5.6",
+        "displayName": "GPT-5.6",
+    }) == "GPT-5.6"

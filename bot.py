@@ -1224,7 +1224,29 @@ class TelegramCodexBot:
         currency = pricing.get("currency") or model.get("currency")
         currency_label = "$" if not currency or str(currency).upper() == "USD" else str(currency)
         rendered = "/".join(value for value in (input_rendered, output_rendered) if value)
-        return f"{currency_label}/1M: {rendered}"
+        return f"{rendered} {currency_label}/1M"
+
+    @classmethod
+    def _model_button_label(cls, model: dict[str, Any]) -> str:
+        """Use the provider's name, minus an unambiguous leading developer."""
+        label = str(model.get("displayName") or model.get("model") or model.get("id") or "").strip()
+        model_id = str(model.get("model") or model.get("id") or "").lstrip("~")
+        candidates = [cls._model_developer(model)]
+        if "/" in model_id:
+            candidates.append(model_id.partition("/")[0])
+        for developer in candidates:
+            developer = developer.strip()
+            if not developer or developer.casefold() == "other":
+                continue
+            match = re.match(
+                rf"^{re.escape(developer)}\s*(?=[:/·—–-]\s*|\s+)",
+                label,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                label = label[match.end():].lstrip(" :/·—–-").strip()
+                break
+        return label or str(model.get("displayName") or model_id)
 
     async def _render_model_menu(
         self,
@@ -1301,7 +1323,7 @@ class TelegramCodexBot:
                     model_id,
                     set(self._model_reasoning_efforts(model)),
                 )
-                label = str(model.get("displayName") or model_id)
+                label = self._model_button_label(model)
                 if model.get("isDefault"):
                     label += " · default"
                 price = self._model_price_label(model)
