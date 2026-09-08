@@ -1,4 +1,5 @@
 import asyncio
+from unittest.mock import AsyncMock
 
 from bot import Session, TelegramCodexBot
 
@@ -59,3 +60,22 @@ def test_gonka_picker_has_only_gonka_models() -> None:
         "gonka-deepseek",
         "gonka-kimi",
     ]
+
+
+def test_model_picker_includes_per_topic_provider_buttons() -> None:
+    bot = object.__new__(TelegramCodexBot)
+    key = (1, "forum", 2)
+    session = Session(key=key, provider="gonka")
+    bot.sessions = {key: session}
+    bot.model_choices = {}
+    bot._send_html = AsyncMock()
+
+    asyncio.run(bot._show_model_menu(key))
+
+    _, _, keyboard = bot._send_html.await_args.args
+    provider_buttons = keyboard.inline_keyboard[0]
+    assert [button.callback_data for button in provider_buttons] == [
+        "provider:set:openai",
+        "provider:set:gonka",
+    ]
+    assert provider_buttons[1].text.startswith("✓ ")

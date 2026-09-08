@@ -930,6 +930,7 @@ class TelegramCodexBot:
             "📁 <b>Проект этого topic</b>\n"
             f"<code>{escape(str(session.project_dir))}</code>\n"
             f"Thread: <code>{escape(session.thread_id or 'ещё не создан')}</code>\n"
+            f"Провайдер: <code>{escape(PROVIDERS[session.provider].label)}</code>\n"
             f"Модель: <code>{escape(session.model or 'по умолчанию')}</code>\n"
             f"Глубина: <code>{escape(session.reasoning_effort or 'по умолчанию модели')}</code>"
             + ("\n📌 Постоянная привязка: <code>Agent</code>" if pinned else "")
@@ -1051,7 +1052,7 @@ class TelegramCodexBot:
         await self._send_html(
             session.key,
             f"✅ Провайдер: <code>{escape(PROVIDERS[provider].label)}</code>\n"
-            "Откройте /model, чтобы выбрать модель этого провайдера.",
+            "Модели и thread другого провайдера сохранены отдельно для этого topic.",
         )
         await self._show_model_menu(session.key)
 
@@ -1095,7 +1096,15 @@ class TelegramCodexBot:
             if choice[0] != key
         }
         current = session.model
-        rows: list[list[InlineKeyboardButton]] = []
+        provider_rows: list[InlineKeyboardButton] = []
+        for provider, definition in PROVIDERS.items():
+            selected_provider = provider == session.provider
+            provider_rows.append(InlineKeyboardButton(
+                text=("✓ " if selected_provider else "") + definition.label,
+                callback_data=f"provider:set:{provider}",
+                style="success" if selected_provider else "primary",
+            ))
+        rows: list[list[InlineKeyboardButton]] = [provider_rows]
         for model in models[:30]:
             model_id = str(model.get("model") or model.get("id") or "")
             if not model_id:
@@ -1134,7 +1143,8 @@ class TelegramCodexBot:
             else "🧠 <b>Модель для этого topic</b>\n"
             f"Провайдер: <code>{escape(PROVIDERS[session.provider].label)}</code>\n"
             f"Сейчас: <code>{escape(current or 'рекомендованная по умолчанию')}</code>\n\n"
-            "Выбор сохранится только для этого topic и провайдера."
+            "Сначала выберите провайдера кнопками выше. Модель и thread хранятся "
+            "отдельно для каждого provider в каждом topic."
         )
         await self._send_html(key, text, InlineKeyboardMarkup(inline_keyboard=rows))
 
