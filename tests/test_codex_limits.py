@@ -42,3 +42,60 @@ def test_formats_snake_case_rate_limit_event() -> None:
 
     assert "0%" in text
     assert "последние полученные" in text
+
+
+def test_five_hour_rollover_is_not_a_full_reset() -> None:
+    previous = TelegramCodexBot._codex_limits_snapshot(
+        {
+            "primary": {"usedPercent": 80, "resetsAt": 1_800_001_000},
+            "secondary": {"usedPercent": 40, "resetsAt": 1_800_100_000},
+        }
+    )
+    current = TelegramCodexBot._codex_limits_snapshot(
+        {
+            "primary": {"usedPercent": 0, "resetsAt": 1_800_019_000},
+            "secondary": {"usedPercent": 40, "resetsAt": 1_800_100_000},
+        }
+    )
+
+    assert not TelegramCodexBot._is_unscheduled_full_limits_reset(
+        previous, current, now=1_800_019_000
+    )
+
+
+def test_early_full_reset_is_detected() -> None:
+    previous = TelegramCodexBot._codex_limits_snapshot(
+        {
+            "primary": {"usedPercent": 80, "resetsAt": 1_800_001_000},
+            "secondary": {"usedPercent": 40, "resetsAt": 1_800_100_000},
+        }
+    )
+    current = TelegramCodexBot._codex_limits_snapshot(
+        {
+            "primary": {"usedPercent": 0, "resetsAt": 1_800_019_000},
+            "secondary": {"usedPercent": 0, "resetsAt": 1_800_119_000},
+        }
+    )
+
+    assert TelegramCodexBot._is_unscheduled_full_limits_reset(
+        previous, current, now=1_800_019_000
+    )
+
+
+def test_scheduled_secondary_rollover_is_not_reported() -> None:
+    previous = TelegramCodexBot._codex_limits_snapshot(
+        {
+            "primary": {"usedPercent": 80, "resetsAt": 1_800_001_000},
+            "secondary": {"usedPercent": 40, "resetsAt": 1_800_019_000},
+        }
+    )
+    current = TelegramCodexBot._codex_limits_snapshot(
+        {
+            "primary": {"usedPercent": 0, "resetsAt": 1_800_037_000},
+            "secondary": {"usedPercent": 0, "resetsAt": 1_800_623_000},
+        }
+    )
+
+    assert not TelegramCodexBot._is_unscheduled_full_limits_reset(
+        previous, current, now=1_800_019_000
+    )

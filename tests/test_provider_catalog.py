@@ -180,6 +180,22 @@ def test_price_label_uses_per_million_input_and_output_tokens() -> None:
     }) == "0.64/1.28 $/1M"
 
 
+def test_price_label_uses_nested_gonka_pricing() -> None:
+    assert TelegramCodexBot._model_price_label({
+        "pricing": {
+            "input_cost_per_token": 1.227563e-9,
+            "output_cost_per_token": 1.227563e-9,
+            "usd_per_million_tokens": 0.001227563,
+        },
+    }) == "0.0012/0.0012 $/1M"
+
+
+def test_price_label_falls_back_to_gonka_usd_per_million_tokens() -> None:
+    assert TelegramCodexBot._model_price_label({
+        "pricing": {"usd_per_million_tokens": 0.001227563},
+    }) == "0.0012/0.0012 $/1M"
+
+
 def test_button_label_removes_only_a_matching_leading_developer() -> None:
     assert TelegramCodexBot._model_button_label({
         "model": "openai/gpt-5.6",

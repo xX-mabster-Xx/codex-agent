@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock
 
 from bot import PROVIDERS, Session, TelegramCodexBot
@@ -59,6 +60,36 @@ def test_custom_provider_picker_uses_its_catalog() -> None:
     models = asyncio.run(bot._models_for_provider(session))
 
     assert [model["model"] for model in models] == ["gonka/example"]
+
+
+def test_thread_access_uses_current_app_server_sandbox_enum() -> None:
+    bot = object.__new__(TelegramCodexBot)
+    bot.full_access_until = 0.0
+    bot.trusted_write_dirs = [Path("/tmp/shared")]
+    session = Session(
+        key=(1, "forum", 2),
+        project_dir=Path("/tmp/project"),
+    )
+
+    assert bot._thread_access_params(session) == {
+        "approvalPolicy": "on-request",
+        "sandboxPolicy": {
+            "type": "workspaceWrite",
+            "writableRoots": ["/tmp/project", "/tmp/shared"],
+        },
+    }
+
+
+def test_full_access_uses_current_app_server_sandbox_enum() -> None:
+    bot = object.__new__(TelegramCodexBot)
+    bot.full_access_until = 9_999_999_999.0
+    bot.trusted_write_dirs = []
+    session = Session(key=(1, "forum", 2), project_dir=Path("/tmp/project"))
+
+    assert bot._thread_access_params(session) == {
+        "approvalPolicy": "never",
+        "sandboxPolicy": {"type": "dangerFullAccess"},
+    }
 
 
 def test_model_picker_includes_per_topic_provider_buttons() -> None:

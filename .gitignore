@@ -10,6 +10,7 @@ __pycache__/
 logs/
 var/
 *.session
+downloads/
 
 # Upstream projects retain their own Git history and are versioned separately.
 third_party/

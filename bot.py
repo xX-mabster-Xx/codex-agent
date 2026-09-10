@@ -71,8 +71,23 @@ GOOGLE_OAUTH_URL_RE = re.compile(
     r"https://accounts\.google\.com/o/oauth2/(?:v2/)?auth\?[^\s<>\])]+"
 )
 SHELL_SUDO_RE = re.compile(r"(?:^|[;&|]\s*)sudo(?:\s|$)")
+READ_ONLY_COMMAND_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:cd\s+[^;&|]+|export\s+[^;&|]+|set\s+[^;&|]+|"
+    r"sed(?!\s+-i(?:\s|$))|rg|grep|find|ls|tree|pwd|head|tail|cat|less|more|"
+    r"wc|file|stat|du|which|git\s+(?:status|diff|log|show|branch|rev-parse))\b",
+    re.IGNORECASE,
+)
+READ_ONLY_WRITE_MARKER_RE = re.compile(
+    r"(?:\bsed\s+-i\b|(?:^|[;&|]\s*)(?:rm|mv|cp|mkdir|touch|tee|chmod|chown|"
+    r"install|apply_patch|pytest|npm\s+(?:install|run\s+build)|cargo|make|"
+    r"git\s+(?:add|commit|checkout|restore|reset|apply))\b|>>?|\bcat\s+>)",
+    re.IGNORECASE,
+)
 FULL_ACCESS_DURATIONS_MINUTES = (15, 60, 240)
 MAX_FULL_ACCESS_MINUTES = 480
+CODEX_LIMITS_CHECK_INTERVAL_SECONDS = 300
+CODEX_LIMITS_RESET_GRACE_SECONDS = 15 * 60
+CODEX_LIMITS_RESET_THRESHOLD_PERCENT = 1.0
 REASONING_EFFORTS = {"low", "medium", "high", "xhigh", "max", "ultra"}
 SCHEDULE_TIMEZONE = ZoneInfo("Europe/Moscow")
 SCHEDULE_RELATIVE_PREFIX_RE = re.compile(r"^(?:in|через)\s+(.+)$", re.I)
@@ -297,6 +312,7 @@ class TurnSummary:
     command_messages: dict[str, int] = field(default_factory=dict)
     command_completed_ids: set[str] = field(default_factory=set)
     hidden_command_ids: set[str] = field(default_factory=set)
+    quiet_command_ids: set[str] = field(default_factory=set)
     command_text: dict[str, str] = field(default_factory=dict)
     command_output: dict[str, str] = field(default_factory=dict)
     command_updated_at: dict[str, float] = field(default_factory=dict)
@@ -309,6 +325,9 @@ class TurnSummary:
     sent_agent_message_ids: set[str] = field(default_factory=set)
     plan_message_ids: list[int] = field(default_factory=list)
     plan_text: str = ""
+    reasoning_message_id: int | None = None
+    reasoning_blocks: list[str] = field(default_factory=list)
+    reasoning_item_ids: set[str] = field(default_factory=set)
     activity_title: str = ""
     activity_detail: str = ""
     reasoning_text: str = ""
@@ -455,6 +474,7 @@ class TelegramCodexBot:
         self.effort_choices: dict[str, tuple[TopicKey, str, str]] = {}
         self._forum_icon_ids: dict[str, str] | None = None
         self._codex_rate_limits: dict[str, Any] | None = None
+        self._codex_limits_monitor_snapshot: dict[str, Any] | None = None
         self.full_access_until = self._load_full_access_until()
         self.trusted_write_dirs = self._load_trusted_write_dirs()
         self._background: list[asyncio.Task[None]] = []
@@ -484,6 +504,9 @@ class TelegramCodexBot:
             self._background.extend([
                 asyncio.create_task(self._codex_health_loop(), name="codex-health"),
                 asyncio.create_task(self._scheduled_jobs_loop(), name="scheduled-jobs"),
+                asyncio.create_task(
+                    self._codex_limits_loop(), name="codex-limits"
+                ),
             ])
             await self.dp.start_polling(
                 self.bot,
@@ -1280,15 +1303,17 @@ class TelegramCodexBot:
                 session.pending_context_providers.add(provider)
             self._save_state()
         try:
-            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.edit_text(
+                f"✅ <b>Провайдер</b>: <code>{escape(PROVIDERS[provider].label)}</code>",
+                reply_markup=None,
+                link_preview_options={"is_disabled": True},
+            )
         except TelegramAPIError:
-            pass
+            try:
+                await callback.message.edit_reply_markup(reply_markup=None)
+            except TelegramAPIError:
+                pass
         await callback.answer(f"Выбран {PROVIDERS[provider].label}")
-        await self._send_html(
-            session.key,
-            f"✅ Провайдер: <code>{escape(PROVIDERS[provider].label)}</code>\n"
-            "Модели и thread другого провайдера сохранены отдельно для этого topic.",
-        )
         await self._show_model_menu(session.key)
 
     async def on_effort(self, message: Message) -> None:
@@ -1358,21 +1383,48 @@ class TelegramCodexBot:
 
     @staticmethod
     def _model_price_label(model: dict[str, Any]) -> str:
-        """Render common OpenAI/OpenRouter-compatible per-token prices."""
+        """Render common per-token prices, including nested Gonka pricing."""
         pricing = model.get("pricing")
         pricing = pricing if isinstance(pricing, dict) else {}
-        input_price = (
-            pricing.get("prompt") or pricing.get("input")
-            or model.get("input_cost_per_token") or model.get("input_price")
+
+        def first_value(*values: Any) -> Any:
+            for value in values:
+                if value is not None and value != "":
+                    return value
+            return None
+
+        # Gonka puts its LiteLLM-compatible prices under `pricing`, while
+        # other providers commonly put them directly on the model object.
+        input_price = first_value(
+            pricing.get("input_cost_per_token"), pricing.get("prompt"),
+            pricing.get("input"), pricing.get("input_price"),
+            model.get("input_cost_per_token"), model.get("input_price"),
         )
-        output_price = (
-            pricing.get("completion") or pricing.get("output")
-            or model.get("output_cost_per_token") or model.get("output_price")
+        output_price = first_value(
+            pricing.get("output_cost_per_token"), pricing.get("completion"),
+            pricing.get("output"), pricing.get("output_price"),
+            model.get("output_cost_per_token"), model.get("output_price"),
+        )
+        # Some APIs (including Gonka) expose a single USD/M-token rate instead
+        # of separate direction-specific fields. Use it for both directions.
+        common_per_million = first_value(
+            pricing.get("usd_per_million_tokens"),
+            model.get("usd_per_million_tokens"),
+        )
+        input_per_million = first_value(
+            pricing.get("input_cost_per_million_tokens"), common_per_million,
+            model.get("input_cost_per_million_tokens"),
+        )
+        output_per_million = first_value(
+            pricing.get("output_cost_per_million_tokens"), common_per_million,
+            model.get("output_cost_per_million_tokens"),
         )
 
-        def per_million(value: Any) -> str | None:
+        def per_million(value: Any, *, already_per_million: bool = False) -> str | None:
             try:
-                amount = Decimal(str(value)) * Decimal(1_000_000)
+                amount = Decimal(str(value))
+                if not already_per_million:
+                    amount *= Decimal(1_000_000)
             except (InvalidOperation, ValueError):
                 return None
             if amount < 0:
@@ -1380,8 +1432,14 @@ class TelegramCodexBot:
             rendered = f"{amount:.4f}".rstrip("0").rstrip(".")
             return rendered or "0"
 
-        input_rendered = per_million(input_price) if input_price is not None else None
-        output_rendered = per_million(output_price) if output_price is not None else None
+        input_rendered = (
+            per_million(input_price) if input_price is not None
+            else per_million(input_per_million, already_per_million=True)
+        )
+        output_rendered = (
+            per_million(output_price) if output_price is not None
+            else per_million(output_per_million, already_per_million=True)
+        )
         if not input_rendered and not output_rendered:
             return ""
         currency = pricing.get("currency") or model.get("currency")
@@ -1764,16 +1822,17 @@ class TelegramCodexBot:
         log.info("Model selected key=%s model=%s", key, model_id)
         if callback.message:
             try:
-                await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.message.edit_text(
+                    f"✅ <b>Модель</b>: <code>{escape(model_id)}</code>",
+                    reply_markup=None,
+                    link_preview_options={"is_disabled": True},
+                )
             except TelegramAPIError:
-                pass
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                except TelegramAPIError:
+                    pass
         await callback.answer(f"Выбрана {model_id}")
-        queued_count = len(session.queued_inputs)
-        await self._send_html(
-            key,
-            f"✅ Модель: <code>{escape(model_id)}</code>"
-            + ("\n⏳ Запускаю сохранённую задачу…" if queued_count else "\nПишите задачу."),
-        )
         await self._drain_queued_inputs(session)
 
     @staticmethod
@@ -1878,16 +1937,18 @@ class TelegramCodexBot:
             self._save_state()
         if callback.message:
             try:
-                await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.message.edit_text(
+                    f"✅ <b>Глубина рассуждений</b>: <code>{escape(effort)}</code>",
+                    reply_markup=None,
+                    link_preview_options={"is_disabled": True},
+                )
             except TelegramAPIError:
-                pass
+                try:
+                    await callback.message.edit_reply_markup(reply_markup=None)
+                except TelegramAPIError:
+                    pass
         log.info("Reasoning effort selected key=%s effort=%s", key, effort)
         await callback.answer(f"Глубина: {effort}")
-        await self._send_html(
-            key,
-            f"✅ Глубина рассуждений: <code>{escape(effort)}</code>\n"
-            "Применится к следующей задаче этого topic.",
-        )
 
     async def _create_topic_from_message(self, message: Message, name: str) -> None:
         title, emoji = self._topic_presentation(name)
@@ -2459,17 +2520,21 @@ class TelegramCodexBot:
         lines.append("\nОтмена: <code>/cancel НОМЕР</code> в соответствующем topic.")
         await self._answer(message, "\n\n".join(lines))
 
+    async def _read_codex_limits(self, provider: str) -> dict[str, Any]:
+        result = await self._rpc(
+            "account/rateLimits/read", {}, provider=provider, timeout=15
+        )
+        limits = result.get("rateLimits") or result.get("rate_limits")
+        if not isinstance(limits, dict):
+            raise CodexRPCError("app-server returned no Codex rate limits")
+        self._codex_rate_limits = limits
+        return limits
+
     async def on_limits(self, message: Message) -> None:
         stale = False
         try:
             provider = self._session(message).provider
-            result = await self._rpc(
-                "account/rateLimits/read", {}, provider=provider, timeout=15
-            )
-            limits = result.get("rateLimits")
-            if not isinstance(limits, dict):
-                raise CodexRPCError("app-server returned no Codex rate limits")
-            self._codex_rate_limits = limits
+            limits = await self._read_codex_limits(provider)
         except CodexRPCError as error:
             limits = self._codex_rate_limits
             stale = True
@@ -2550,6 +2615,124 @@ class TelegramCodexBot:
         if reached:
             rows.append(f"⚠️ Достигнут лимит: <code>{escape(str(reached))}</code>")
         return header + "\n\n" + "\n".join(rows)
+
+    @classmethod
+    def _codex_limits_snapshot(cls, limits: dict[str, Any]) -> dict[str, Any]:
+        snapshot: dict[str, Any] = {}
+        for name in ("primary", "secondary"):
+            data = limits.get(name)
+            if not isinstance(data, dict):
+                continue
+            used = cls._rate_limit_value(data, "usedPercent", "used_percent")
+            reset = cls._rate_limit_value(data, "resetsAt", "resets_at")
+            try:
+                used = float(used) if used is not None else None
+            except (TypeError, ValueError):
+                used = None
+            try:
+                reset = float(reset) if reset is not None else None
+            except (TypeError, ValueError):
+                reset = None
+            snapshot[name] = {"used": used, "reset": reset}
+        return snapshot
+
+    @classmethod
+    def _is_unscheduled_full_limits_reset(
+        cls,
+        previous: dict[str, Any] | None,
+        current: dict[str, Any],
+        *,
+        now: float,
+    ) -> bool:
+        """Detect a secondary-window reset before its advertised reset time.
+
+        The primary window normally resets every five hours.  A drop in that
+        bucket alone is therefore expected.  The secondary (usually seven-day)
+        bucket is the signal for a full reset; requiring both buckets to move
+        avoids alerts for the ordinary five-hour rollover.
+        """
+        if not previous:
+            return False
+        old_primary = previous.get("primary") or {}
+        old_secondary = previous.get("secondary") or {}
+        new_primary = current.get("primary") or {}
+        new_secondary = current.get("secondary") or {}
+        old_secondary_used = old_secondary.get("used")
+        new_secondary_used = new_secondary.get("used")
+        if old_secondary_used is None or new_secondary_used is None:
+            return False
+        secondary_drop = old_secondary_used - new_secondary_used
+        if secondary_drop < CODEX_LIMITS_RESET_THRESHOLD_PERCENT:
+            return False
+
+        old_primary_used = old_primary.get("used")
+        new_primary_used = new_primary.get("used")
+        primary_drop = (
+            old_primary_used - new_primary_used
+            if old_primary_used is not None and new_primary_used is not None
+            else 0.0
+        )
+        if (
+            primary_drop < CODEX_LIMITS_RESET_THRESHOLD_PERCENT
+            and (new_primary_used is None or new_primary_used > 0.0)
+        ):
+            return False
+
+        advertised_reset = old_secondary.get("reset")
+        # If the advertised weekly reset was due, this is the expected rollover,
+        # not the out-of-band reset the monitor is meant to report.
+        if (
+            advertised_reset is not None
+            and advertised_reset <= now + CODEX_LIMITS_RESET_GRACE_SECONDS
+        ):
+            return False
+        return True
+
+    def _agent_topic_key(self) -> TopicKey | None:
+        for key, session in self.sessions.items():
+            if self._is_agent_topic(key, session.topic_name):
+                return key
+        topic_id = self.config.agent_topic_id
+        if topic_id is None:
+            return None
+        return (self.config.telegram_user_id, "forum", topic_id)
+
+    async def _notify_full_limits_reset(self, limits: dict[str, Any]) -> None:
+        key = self._agent_topic_key()
+        if key is None:
+            log.warning(
+                "Cannot report an unscheduled Codex limits reset: "
+                "Agent topic is unknown"
+            )
+            return
+        text = (
+            "🚨 <b>Внеплановый полный сброс лимитов Codex</b>\n\n"
+            "Мониторинг увидел сброс основного и дополнительного окон раньше "
+            "заявленного времени.\n\n"
+            f"{self._format_codex_limits(limits, stale=False)}"
+        )
+        await self._send_html(key, text, silent=False)
+
+    async def _codex_limits_loop(self) -> None:
+        """Poll limits and report an out-of-band full reset in Agent topic."""
+        while True:
+            try:
+                limits = await self._read_codex_limits(DEFAULT_PROVIDER)
+                current = self._codex_limits_snapshot(limits)
+                if self._is_unscheduled_full_limits_reset(
+                    self._codex_limits_monitor_snapshot,
+                    current,
+                    now=time.time(),
+                ):
+                    await self._notify_full_limits_reset(limits)
+                self._codex_limits_monitor_snapshot = current
+            except asyncio.CancelledError:
+                raise
+            except CodexRPCError as error:
+                log.warning("Periodic Codex limits check failed: %s", error)
+            except Exception:
+                log.exception("Periodic Codex limits check failed unexpectedly")
+            await asyncio.sleep(CODEX_LIMITS_CHECK_INTERVAL_SECONDS)
 
     async def on_cancel_scheduled(self, message: Message) -> None:
         argument = (message.text or "").partition(" ")[2].strip()
@@ -3111,6 +3294,10 @@ class TelegramCodexBot:
             turn_params: dict[str, Any] = {
                 "threadId": session.thread_id,
                 "input": turn_input,
+                # Re-apply access on every turn.  This is important for
+                # threads created by an older bot version whose thread-level
+                # sandbox silently fell back to read-only.
+                **self._thread_access_params(session),
             }
             if session.model:
                 turn_params["model"] = session.model
@@ -3688,6 +3875,12 @@ class TelegramCodexBot:
                 summary.hidden_command_ids.add(item_id)
                 log.info("Internal skill command hidden key=%s command=%r", key, command)
                 return
+            if self._is_low_signal_command(command):
+                summary.quiet_command_ids.add(item_id)
+                self._set_activity(summary, "⚙️ Выполняется команда")
+                log.info("Low-signal command hidden key=%s command=%r", key, command)
+                await self._update_activity(key, summary)
+                return
             self._set_activity(
                 summary,
                 "⚙️ Выполняется команда",
@@ -3773,6 +3966,10 @@ class TelegramCodexBot:
                 command,
             )
             icon = "✅" if status == "completed" and exit_code in (0, None) else "❌"
+            if item_id in summary.quiet_command_ids and icon == "✅":
+                self._set_activity(summary, "✅ Команда завершена")
+                await self._update_activity(key, summary)
+                return
             details = (
                 f"{icon} <b>Команда: {escape(str(status))}</b>"
                 + (f" · exit <code>{exit_code}</code>" if exit_code is not None else "")
@@ -3832,8 +4029,10 @@ class TelegramCodexBot:
             self._set_activity(summary, "📋 План обновлён")
             await self._update_activity(key, summary)
         elif item_type == "reasoning" and item.get("summary"):
+            item_id = str(item.get("id") or f"reasoning-{len(summary.reasoning_item_ids)}")
             reasoning = "\n".join(item["summary"])
-            self._set_activity(summary, "💭 Агент размышляет", reasoning=reasoning)
+            await self._append_reasoning(key, summary, item_id, reasoning)
+            self._set_activity(summary, "💭 Агент размышляет")
             await self._update_activity(key, summary)
 
     async def _update_command_output(
@@ -3876,6 +4075,17 @@ class TelegramCodexBot:
     def _is_internal_skill_command(command: str) -> bool:
         """Keep Codex's own skill-instruction reads out of the chat UI."""
         return "/.codex/skills/" in command and "SKILL.md" in command
+
+    @staticmethod
+    def _is_low_signal_command(command: str) -> bool:
+        """Hide routine read-only inspection commands from the chat UI."""
+        text = command.strip()
+        wrapper = re.fullmatch(r"(?:/usr/bin/)?(?:bash|zsh|sh)\s+-lc\s+(['\"])(.*)\1", text, re.DOTALL)
+        if wrapper:
+            text = wrapper.group(2).strip()
+        if not text or READ_ONLY_WRITE_MARKER_RE.search(text):
+            return False
+        return bool(READ_ONLY_COMMAND_RE.search(text))
 
     async def _requests_loop(self, provider: str) -> None:
         while True:
@@ -4703,11 +4913,17 @@ class TelegramCodexBot:
 
     def _thread_access_params(self, session: Session) -> dict[str, Any]:
         if self._full_access_enabled():
-            return {"approvalPolicy": "never", "sandbox": "danger-full-access"}
+            return {
+                "approvalPolicy": "never",
+                "sandboxPolicy": {"type": "dangerFullAccess"},
+            }
         return {
             "approvalPolicy": "on-request",
             "sandboxPolicy": {
-                "type": "workspace-write",
+                # app-server v2 uses camelCase enum values.  The old
+                # kebab-case value is ignored by current Codex and leaves a
+                # thread in its default read-only policy.
+                "type": "workspaceWrite",
                 "writableRoots": [
                     str(root) for root in self._writable_roots_for_session(session)
                 ],
@@ -4818,6 +5034,31 @@ class TelegramCodexBot:
         summary.activity_detail = detail
         summary.reasoning_text = reasoning
 
+    async def _append_reasoning(
+        self,
+        key: TopicKey,
+        summary: TurnSummary,
+        item_id: str,
+        reasoning: str,
+    ) -> None:
+        """Keep completed reasoning in a permanent, expandable quote block."""
+        reasoning = reasoning.strip()
+        if not reasoning or item_id in summary.reasoning_item_ids:
+            return
+        summary.reasoning_item_ids.add(item_id)
+        block = (
+            "<blockquote expandable><b>💭 Размышление</b>\n"
+            f"{escape(reasoning[:1600])}</blockquote>"
+        )
+        candidate = "\n\n".join((*summary.reasoning_blocks, block))
+        if summary.reasoning_message_id and len(candidate) <= 3900:
+            if await self._edit_html(key, summary.reasoning_message_id, candidate):
+                summary.reasoning_blocks.append(block)
+                return
+        sent = await self._send_html(key, block)
+        summary.reasoning_message_id = sent.message_id
+        summary.reasoning_blocks = [block]
+
     async def _replace_plan(
         self, key: TopicKey, summary: TurnSummary, text: str
     ) -> None:
@@ -4889,11 +5130,6 @@ class TelegramCodexBot:
 
         if summary.error_text:
             lines.append(f"<code>{escape(summary.error_text[:1200])}</code>")
-        elif not status and summary.reasoning_text:
-            lines.append(
-                "<blockquote expandable><b>Размышление</b>\n"
-                f"{escape(summary.reasoning_text[:1200])}</blockquote>"
-            )
         elif not status and summary.activity_detail:
             lines.append(f"<code>{escape(summary.activity_detail[:1000])}</code>")
 
