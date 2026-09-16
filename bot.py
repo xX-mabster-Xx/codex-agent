@@ -36,6 +36,7 @@ from aiogram.types import (
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
+    MessageReactionUpdated,
 )
 
 from codex_client import (
@@ -471,6 +472,7 @@ class TelegramCodexBot:
         self.busy_inputs: dict[str, PendingBusyInput] = {}
         self.model_choices: dict[str, tuple[TopicKey, str, str, set[str]]] = {}
         self.model_catalog_actions: dict[str, ModelMenuAction] = {}
+        self.agent_message_topics: dict[tuple[int, int], TopicKey] = {}
         self.effort_choices: dict[str, tuple[TopicKey, str, str]] = {}
         self._forum_icon_ids: dict[str, str] | None = None
         self._codex_rate_limits: dict[str, Any] | None = None
@@ -548,6 +550,7 @@ class TelegramCodexBot:
             [
                 BotCommand(command="start", description="Статус и помощь"),
                 BotCommand(command="topic", description="Создать новый topic"),
+                BotCommand(command="split", description="Новый topic в той же папке"),
                 BotCommand(command="project", description="Путь текущего проекта"),
                 BotCommand(command="provider", description="Выбрать провайдера"),
                 BotCommand(command="model", description="Выбрать модель Codex"),
@@ -576,6 +579,7 @@ class TelegramCodexBot:
 
         self.router.message.register(self.on_start, CommandStart())
         self.router.message.register(self.on_topic, Command("topic"))
+        self.router.message.register(self.on_split, Command("split"))
         self.router.message.register(self.on_project, Command("project"))
         self.router.message.register(self.on_provider, Command("provider"))
         self.router.message.register(self.on_model, Command("model"))
@@ -592,6 +596,7 @@ class TelegramCodexBot:
         self.router.message.register(self.on_limits, Command("limits"))
         self.router.message.register(self.on_cancel_scheduled, Command("cancel"))
         self.router.message.register(self.on_restart, Command("restart"))
+        self.router.message_reaction.register(self.on_message_reaction)
         self.router.message.register(
             self.on_forum_topic_created, F.forum_topic_created
         )
@@ -624,6 +629,9 @@ class TelegramCodexBot:
         )
         self.router.callback_query.register(
             self.on_subagents_stop, F.data.startswith("agents:stop:")
+        )
+        self.router.callback_query.register(
+            self.on_info_action, F.data.startswith("info:")
         )
         self.router.callback_query.register(
             self.on_approval_full_access, F.data.startswith("approval_full:")
@@ -1158,6 +1166,7 @@ class TelegramCodexBot:
             f"🤖 Codex-сессия {state} для этого чата/topic.\n\n"
             f"📁 <code>{escape(str(session.project_dir))}</code>\n\n{topic_hint}\n\n"
             "Отправьте обычное сообщение. /model — модель, /new — новый thread, "
+            "/split — новый topic в той же папке, "
             "/stop — подтверждённая остановка. /remind — напоминание, /task — "
             "отложенная задача.",
             reply_markup=keyboard,
@@ -1172,6 +1181,22 @@ class TelegramCodexBot:
             )
             return
         await self._create_topic_from_message(message, name[:128])
+
+    async def on_split(self, message: Message) -> None:
+        """Create a fresh topic/thread while keeping the current project folder."""
+        source = self._session(message)
+        name = (message.text or "").partition(" ")[2].strip()
+        if not name:
+            source_name = source.topic_name or "проект"
+            name = f"{source_name} — split"
+        name = name[:128]
+        source.project_dir = source.project_dir or self._default_project_dir(source.key)
+        await self._create_topic_from_message(
+            message,
+            name,
+            project_dir=source.project_dir,
+            inherit_session=source,
+        )
 
     async def on_new_topic_button(self, callback: CallbackQuery) -> None:
         if not isinstance(callback.message, Message):
@@ -1950,7 +1975,14 @@ class TelegramCodexBot:
         log.info("Reasoning effort selected key=%s effort=%s", key, effort)
         await callback.answer(f"Глубина: {effort}")
 
-    async def _create_topic_from_message(self, message: Message, name: str) -> None:
+    async def _create_topic_from_message(
+        self,
+        message: Message,
+        name: str,
+        *,
+        project_dir: Path | None = None,
+        inherit_session: Session | None = None,
+    ) -> None:
         title, emoji = self._topic_presentation(name)
         icon_id = await self._forum_icon_id(emoji)
         topic_options: dict[str, Any] = (
@@ -1971,7 +2003,15 @@ class TelegramCodexBot:
                 name=title,
                 **topic_options,
             )
-            session = self._new_topic_session(message.chat.id, topic)
+            session = self._new_topic_session(
+                message.chat.id, topic, project_dir=project_dir
+            )
+            if inherit_session is not None:
+                session.provider = inherit_session.provider
+                session.model = inherit_session.model
+                session.reasoning_effort = inherit_session.reasoning_effort
+                session.awaiting_model_selection = inherit_session.awaiting_model_selection
+                self._save_state()
         except (TelegramAPIError, CodexRPCError, OSError) as error:
             await self._answer(message,
                 "❌ Не удалось создать topic. В личном чате включите Topics в "
@@ -2228,6 +2268,129 @@ class TelegramCodexBot:
             self._subagent_status_text(states),
             reply_markup=InlineKeyboardMarkup(inline_keyboard=rows) if rows else None,
         )
+
+    def _topic_info_text(self, session: Session) -> str:
+        jobs = self.scheduler.list_pending(session.key)
+        states = self._subagents_for(session.key, session.provider, session.thread_id)
+        active_children = sum(self._subagent_is_active(state) for state in states)
+        turn = "выполняется" if session.active_turn_id else "не выполняется"
+        lines = [
+            "ℹ️ <b>Состояние agent topic</b>",
+            f"Модель: <code>{escape(session.model or 'по умолчанию')}</code>",
+            f"Провайдер: <code>{escape(PROVIDERS[session.provider].label)}</code>",
+            f"Папка: <code>{escape(str(session.project_dir or self._default_project_dir(session.key)))}</code>",
+            f"Codex thread: <code>{escape(session.thread_id or 'ещё не создан')}</code>",
+            f"Глубина: <code>{escape(session.reasoning_effort or 'по умолчанию модели')}</code>",
+            f"Turn: <b>{turn}</b> · в очереди: <b>{len(session.queued_inputs)}</b>",
+            f"Subagents: <b>{active_children} активных / {len(states)} всего</b>",
+            f"Напоминания и задачи: <b>{len(jobs)}</b>",
+        ]
+        if session.attached:
+            lines.append("📌 Thread привязан к проекту")
+        return "\n".join(lines)
+
+    def _topic_info_keyboard(self, session: Session) -> InlineKeyboardMarkup:
+        jobs = self.scheduler.list_pending(session.key)
+        states = self._subagents_for(session.key, session.provider, session.thread_id)
+        rows: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(text="📁 Проект", callback_data="info:project"),
+             InlineKeyboardButton(text="📊 Лимиты", callback_data="info:limits"),
+             InlineKeyboardButton(text="🔄 Обновить", callback_data="info:refresh")],
+            [InlineKeyboardButton(text="🔌 Провайдер", callback_data="info:provider"),
+             InlineKeyboardButton(text="🧠 Модель", callback_data="info:model"),
+             InlineKeyboardButton(text="🧩 Effort", callback_data="info:effort")],
+        ]
+        if session.active_turn_id or session.preparing:
+            rows.append([
+                InlineKeyboardButton(
+                    text="⏹ Стоп",
+                    callback_data="info:stop",
+                    style="danger",
+                )
+            ])
+        if states:
+            rows.append([InlineKeyboardButton(text="🔀 Subagents", callback_data="info:agents")])
+        if jobs:
+            rows.append([InlineKeyboardButton(text="🗓 Напоминания", callback_data="info:reminders")])
+        rows.append([
+            InlineKeyboardButton(text="🆕 Новый thread", callback_data="info:new"),
+            InlineKeyboardButton(text="➗ Новый topic", callback_data="info:split"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="🔓 Full access", callback_data="info:fullaccess"),
+            InlineKeyboardButton(text="📂 Trusted paths", callback_data="info:trustedpath"),
+        ])
+        rows.append([
+            InlineKeyboardButton(text="👀 Follow-ups", callback_data="info:followups"),
+            InlineKeyboardButton(text="♻️ Restart", callback_data="info:restart", style="danger"),
+        ])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def _send_topic_info(self, key: TopicKey) -> None:
+        session = self._session_for_key(key)
+        await self._send_html(
+            key,
+            self._topic_info_text(session),
+            self._topic_info_keyboard(session),
+        )
+
+    async def on_message_reaction(self, event: MessageReactionUpdated) -> None:
+        if not event.user or event.user.id != self.config.telegram_user_id:
+            return
+        if not event.new_reaction:
+            return
+        key = self.agent_message_topics.get((event.chat.id, event.message_id))
+        if key is not None:
+            await self._send_topic_info(key)
+
+    async def on_info_action(self, callback: CallbackQuery) -> None:
+        if not callback.data or not isinstance(callback.message, Message):
+            return
+        await callback.answer()
+        key = self._session(callback.message).key
+        action = callback.data.removeprefix("info:")
+        if action == "model":
+            await self._show_model_menu(key)
+        elif action == "provider":
+            await self._show_provider_menu(key)
+        elif action == "effort":
+            await self._show_effort_menu(key)
+        elif action == "project":
+            await self.on_project(callback.message)
+        elif action == "limits":
+            await self.on_limits(callback.message)
+        elif action == "refresh":
+            await self._send_topic_info(key)
+        elif action == "stop":
+            await self.on_stop(callback.message)
+        elif action == "agents":
+            await self.on_agents(callback.message)
+        elif action == "reminders":
+            await self.on_reminders(callback.message)
+        elif action == "followups":
+            await self.on_followups(callback.message)
+        elif action == "fullaccess":
+            await self._answer(
+                callback.message,
+                self._full_access_status_text()
+                + "\n\n🔓 Чтобы изменить режим, выберите срок ниже.",
+                reply_markup=self._full_access_keyboard(),
+            )
+        elif action == "trustedpath":
+            await self._answer(callback.message, self._trusted_write_dirs_text())
+        elif action == "new":
+            await self.on_new(callback.message)
+        elif action == "split":
+            session = self._session(callback.message)
+            name = f"{session.topic_name or 'проект'} — split"
+            await self._create_topic_from_message(
+                callback.message,
+                name[:128],
+                project_dir=session.project_dir,
+                inherit_session=session,
+            )
+        elif action == "restart":
+            await self.on_restart(callback.message)
 
     async def _stop_subagents(
         self, key: TopicKey, provider: str, root_thread_id: str
@@ -2820,6 +2983,7 @@ class TelegramCodexBot:
     async def on_message(self, message: Message) -> None:
         if not message.text:
             return
+        await self._pin_user_message(message)
         await self._submit_input(
             message,
             [{"type": "text", "text": message.text}],
@@ -3141,6 +3305,7 @@ class TelegramCodexBot:
 
     async def _reserve_preparation(self, message: Message) -> Session | None:
         session = self._session(message)
+        await self._pin_user_message(message)
         async with session.lock:
             # Media can be prepared while Codex is busy; after download or
             # transcription it goes through the same now/queue chooser as text.
@@ -3155,6 +3320,25 @@ class TelegramCodexBot:
             session.preparation_task = asyncio.current_task()
             self._ensure_typing_loop(session)
         return session
+
+    async def _pin_user_message(self, message: Message) -> None:
+        """Pin an incoming user message in its current Telegram topic."""
+        if not message.message_id or not message.chat:
+            return
+        try:
+            await self.bot.pin_chat_message(
+                chat_id=message.chat.id,
+                message_id=message.message_id,
+                disable_notification=True,
+            )
+        except TelegramAPIError as error:
+            # Pinning is a convenience; missing admin rights must not block Codex.
+            log.warning(
+                "Could not pin user message chat=%s message=%s: %s",
+                message.chat.id,
+                message.message_id,
+                error,
+            )
 
     async def _release_preparation(self, session: Session) -> None:
         async with session.lock:
@@ -3178,6 +3362,7 @@ class TelegramCodexBot:
         session.typing_task = asyncio.create_task(
             self._typing_loop(session.key), name=f"typing-{session.key[0]}-{session.key[2]}"
         )
+        log.debug("Typing loop started key=%s", session.key)
 
     def _stop_typing_if_idle(self, session: Session) -> None:
         if session.active_turn_id or session.preparing:
@@ -3194,7 +3379,9 @@ class TelegramCodexBot:
                 try:
                     await self._send_typing_key(key)
                 except TelegramAPIError as error:
-                    log.debug("Could not send typing action key=%s: %s", key, error)
+                    log.warning("Could not send typing action key=%s: %s", key, error)
+                except Exception:
+                    log.exception("Unexpected typing action failure key=%s", key)
                 await asyncio.sleep(4)
         finally:
             session = self.sessions.get(key)
@@ -3776,20 +3963,25 @@ class TelegramCodexBot:
             turn = params.get("turn", {})
             if not isinstance(turn, dict):
                 turn = {}
-            summary = session.turns.pop(turn_id, TurnSummary())
-            completion_error = self._turn_completion_error(params, turn)
-            if completion_error:
-                summary.error_text = completion_error
-            if session.active_turn_id == turn_id:
-                session.active_turn_id = None
-                session.stopping = False
-                self._stop_typing_if_idle(session)
-            if summary.final_text:
-                self._record_context(session, "assistant", summary.final_text)
-            self._save_state()
-            done = session.turn_done.pop(turn_id, None)
-            if done:
-                done.set()
+            # Serialize completion with turn startup.  Without this lock a
+            # very fast turn can complete between turn/start returning and
+            # _start_queued_input assigning active_turn_id, leaving a stale
+            # typing loop running in that topic.
+            async with session.lock:
+                summary = session.turns.pop(turn_id, TurnSummary())
+                completion_error = self._turn_completion_error(params, turn)
+                if completion_error:
+                    summary.error_text = completion_error
+                if session.active_turn_id == turn_id:
+                    session.active_turn_id = None
+                    session.stopping = False
+                    self._stop_typing_if_idle(session)
+                if summary.final_text:
+                    self._record_context(session, "assistant", summary.final_text)
+                self._save_state()
+                done = session.turn_done.pop(turn_id, None)
+                if done:
+                    done.set()
             log.info(
                 "Turn completed key=%s thread=%s turn=%s status=%s commands=%s files=%s tools=%s",
                 key,
@@ -5211,6 +5403,7 @@ class TelegramCodexBot:
                     disable_notification=silent,
                 )
                 messages.append(sent)
+                self._remember_agent_message(key, sent)
             except TelegramAPIError:
                 log.warning("Rich Message failed; falling back to Telegram HTML")
                 messages.append(
@@ -5306,7 +5499,7 @@ class TelegramCodexBot:
     ) -> Message:
         chat_id, topic_kind, topic_id = key
         try:
-            return await self.bot.send_message(
+            sent = await self.bot.send_message(
                 chat_id,
                 text,
                 message_thread_id=topic_id if topic_kind == "forum" else None,
@@ -5317,6 +5510,8 @@ class TelegramCodexBot:
                 link_preview_options={"is_disabled": True},
                 disable_notification=silent,
             )
+            self._remember_agent_message(key, sent)
+            return sent
         except TelegramBadRequest as error:
             if topic_kind == "chat" or "thread not found" not in str(error).lower():
                 raise
@@ -5324,18 +5519,31 @@ class TelegramCodexBot:
                 "Telegram topic disappeared key=%s; sending notification to root chat",
                 key,
             )
-            return await self.bot.send_message(
+            sent = await self.bot.send_message(
                 chat_id,
                 "⚠️ <b>Исходный topic больше недоступен.</b>\n\n" + text,
                 reply_markup=reply_markup,
                 link_preview_options={"is_disabled": True},
                 disable_notification=silent,
             )
+            self._remember_agent_message(key, sent)
+            return sent
+
+    def _remember_agent_message(self, key: TopicKey, message: Message) -> None:
+        """Keep a process-local reverse index for reaction updates."""
+        if message.chat:
+            self.agent_message_topics[(message.chat.id, message.message_id)] = key
+        # Bound memory in long-running bots while retaining recent reactions.
+        if len(self.agent_message_topics) > 10_000:
+            for old_key in list(self.agent_message_topics)[:2_000]:
+                self.agent_message_topics.pop(old_key, None)
 
     async def _answer(self, message: Message, text: str, **kwargs: Any) -> Message:
         kwargs.setdefault("disable_notification", True)
         try:
-            return await message.answer(text, **kwargs)
+            sent = await message.answer(text, **kwargs)
+            self._remember_agent_message(self._session(message).key, sent)
+            return sent
         except TelegramBadRequest as error:
             if "thread not found" not in str(error).lower():
                 raise
@@ -5344,11 +5552,13 @@ class TelegramCodexBot:
                 message.chat.id,
                 message.message_thread_id,
             )
-            return await self.bot.send_message(
+            sent = await self.bot.send_message(
                 message.chat.id,
                 "⚠️ <b>Исходный topic больше недоступен.</b>\n\n" + text,
                 **kwargs,
             )
+            self._remember_agent_message(self._session(message).key, sent)
+            return sent
 
     def _session(self, message: Message) -> Session:
         if message.direct_messages_topic:
@@ -5465,8 +5675,19 @@ class TelegramCodexBot:
             return []
         return [(role, text) for role, text in recovered if text.strip()][-MAX_CONTEXT_LOG_ENTRIES:]
 
-    def _new_topic_session(self, chat_id: int, topic: ForumTopic) -> Session:
-        return self._topic_session(chat_id, topic.message_thread_id, topic.name)
+    def _new_topic_session(
+        self,
+        chat_id: int,
+        topic: ForumTopic,
+        *,
+        project_dir: Path | None = None,
+    ) -> Session:
+        return self._topic_session(
+            chat_id,
+            topic.message_thread_id,
+            topic.name,
+            project_dir=project_dir,
+        )
 
     def _require_model_selection(self, session: Session) -> bool:
         """Assign the default model for a newly created ordinary topic."""
@@ -5477,7 +5698,14 @@ class TelegramCodexBot:
         self._save_state()
         return False
 
-    def _topic_session(self, chat_id: int, topic_id: int, name: str) -> Session:
+    def _topic_session(
+        self,
+        chat_id: int,
+        topic_id: int,
+        name: str,
+        *,
+        project_dir: Path | None = None,
+    ) -> Session:
         key = (chat_id, "forum", topic_id)
         existing = self.sessions.get(key)
         if existing:
@@ -5501,10 +5729,11 @@ class TelegramCodexBot:
                 session.thread_id or "automatic",
             )
             return session
-        root = self.config.projects_root or self.config.project_dir
-        slug = re.sub(r"[^\w.-]+", "-", name.lower()).strip("-._")
-        slug = (slug or "project")[:64]
-        project_dir = root / f"{slug}-{topic_id}"
+        if project_dir is None:
+            root = self.config.projects_root or self.config.project_dir
+            slug = re.sub(r"[^\w.-]+", "-", name.lower()).strip("-._")
+            slug = (slug or "project")[:64]
+            project_dir = root / f"{slug}-{topic_id}"
         project_dir.mkdir(parents=True, exist_ok=True)
         session = Session(key, project_dir=project_dir, topic_name=name)
         self.sessions[key] = session
