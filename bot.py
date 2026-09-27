@@ -55,6 +55,7 @@ from scheduled_jobs import (
     ScheduledJobError,
     ScheduledJobStore,
 )
+from topic_sharing import ShareRegistry
 
 
 log = logging.getLogger(__name__)
@@ -62,6 +63,7 @@ STATE_FILE = Path(__file__).with_name(".sessions.json")
 RESTART_NOTICE_FILE = Path(__file__).with_name(".restart-notice.json")
 FULL_ACCESS_STATE_FILE = Path(__file__).with_name(".full-access.json")
 TRUSTED_WRITE_DIRS_STATE_FILE = Path(__file__).with_name(".trusted-write-dirs.json")
+SHARES_STATE_FILE = Path(__file__).with_name(".shares.json")
 TopicKey = tuple[int, str, int]
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 MAX_DOCUMENT_BYTES = 50 * 1024 * 1024
@@ -397,6 +399,9 @@ class QueuedInput:
     input_items: list[dict[str, Any]]
     input_chars: int
     media_kind: str | None = None
+    origin_user_id: int | None = None
+    origin_name: str | None = None
+    guest_turn: bool = False
 
 
 @dataclass(slots=True)
@@ -485,6 +490,7 @@ class TelegramCodexBot:
         self._shutting_down = False
         self.restart_requested = False
         self.bot_info: Any = None
+        self.shares = ShareRegistry(SHARES_STATE_FILE, config.telegram_user_id)
         self._load_state()
         recovered_jobs = self.scheduler.recover_interrupted()
         if recovered_jobs:
@@ -572,86 +578,78 @@ class TelegramCodexBot:
         )
 
     def _register_handlers(self) -> None:
-        self.router.message.filter(F.from_user.id == self.config.telegram_user_id)
-        self.router.callback_query.filter(
-            F.from_user.id == self.config.telegram_user_id
-        )
+        def owner_message(handler: Any, *filters: Any) -> None:
+            self.router.message.register(handler, *filters, self._owner_only)
+
+        def owner_callback(handler: Any, *filters: Any) -> None:
+            self.router.callback_query.register(handler, *filters, self._owner_only)
 
         self.router.message.register(self.on_start, CommandStart())
-        self.router.message.register(self.on_topic, Command("topic"))
-        self.router.message.register(self.on_split, Command("split"))
-        self.router.message.register(self.on_project, Command("project"))
-        self.router.message.register(self.on_provider, Command("provider"))
-        self.router.message.register(self.on_model, Command("model"))
-        self.router.message.register(self.on_effort, Command(commands=["effort", "reasoning"]))
-        self.router.message.register(self.on_new, Command("new"))
-        self.router.message.register(self.on_stop, Command("stop"))
-        self.router.message.register(self.on_agents, Command("agents"))
-        self.router.message.register(self.on_full_access, Command("fullaccess"))
-        self.router.message.register(self.on_trusted_path, Command("trustedpath"))
-        self.router.message.register(self.on_remind, Command("remind"))
-        self.router.message.register(self.on_task, Command("task"))
-        self.router.message.register(self.on_reminders, Command("reminders"))
-        self.router.message.register(self.on_followups, Command("followups"))
-        self.router.message.register(self.on_limits, Command("limits"))
-        self.router.message.register(self.on_cancel_scheduled, Command("cancel"))
-        self.router.message.register(self.on_restart, Command("restart"))
+        owner_message(self.on_topic, Command("topic"))
+        owner_message(self.on_split, Command("split"))
+        owner_message(self.on_project, Command("project"))
+        owner_message(self.on_provider, Command("provider"))
+        owner_message(self.on_model, Command("model"))
+        owner_message(self.on_effort, Command(commands=["effort", "reasoning"]))
+        owner_message(self.on_new, Command("new"))
+        owner_message(self.on_stop, Command("stop"))
+        owner_message(self.on_agents, Command("agents"))
+        owner_message(self.on_full_access, Command("fullaccess"))
+        owner_message(self.on_trusted_path, Command("trustedpath"))
+        owner_message(self.on_remind, Command("remind"))
+        owner_message(self.on_task, Command("task"))
+        owner_message(self.on_reminders, Command("reminders"))
+        owner_message(self.on_followups, Command("followups"))
+        owner_message(self.on_limits, Command("limits"))
+        owner_message(self.on_cancel_scheduled, Command("cancel"))
+        owner_message(self.on_restart, Command("restart"))
         self.router.message_reaction.register(self.on_message_reaction)
-        self.router.message.register(
-            self.on_forum_topic_created, F.forum_topic_created
-        )
-        self.router.message.register(
-            self.on_forum_topic_edited, F.forum_topic_edited
-        )
-        self.router.callback_query.register(
-            self.on_new_topic_button, F.data == "topic:new"
-        )
-        self.router.callback_query.register(
-            self.on_provider_selected, F.data.startswith("provider:set:")
-        )
-        self.router.callback_query.register(
-            self.on_model_menu, F.data == "model:menu"
-        )
-        self.router.callback_query.register(
-            self.on_model_selected, F.data.startswith("model:set:")
-        )
-        self.router.callback_query.register(
-            self.on_model_catalog, F.data.startswith("model:catalog:")
-        )
-        self.router.callback_query.register(
-            self.on_effort_menu, F.data == "effort:menu"
-        )
-        self.router.callback_query.register(
-            self.on_effort_selected, F.data.startswith("effort:set:")
-        )
-        self.router.callback_query.register(
-            self.on_approval, F.data.startswith("approval:")
-        )
-        self.router.callback_query.register(
-            self.on_subagents_stop, F.data.startswith("agents:stop:")
-        )
-        self.router.callback_query.register(
-            self.on_info_action, F.data.startswith("info:")
-        )
-        self.router.callback_query.register(
-            self.on_approval_full_access, F.data.startswith("approval_full:")
-        )
-        self.router.callback_query.register(
-            self.on_full_access_selected, F.data.startswith("fullaccess:")
-        )
-        self.router.callback_query.register(
-            self.on_busy_input, F.data.startswith("busy:")
-        )
-        self.router.message.register(self.on_photo, F.photo)
+        owner_message(self.on_forum_topic_created, F.forum_topic_created)
+        owner_message(self.on_forum_topic_edited, F.forum_topic_edited)
+        owner_callback(self.on_new_topic_button, F.data == "topic:new")
+        owner_callback(self.on_provider_selected, F.data.startswith("provider:set:"))
+        owner_callback(self.on_model_menu, F.data == "model:menu")
+        owner_callback(self.on_model_selected, F.data.startswith("model:set:"))
+        owner_callback(self.on_model_catalog, F.data.startswith("model:catalog:"))
+        owner_callback(self.on_effort_menu, F.data == "effort:menu")
+        owner_callback(self.on_effort_selected, F.data.startswith("effort:set:"))
+        owner_callback(self.on_approval, F.data.startswith("approval:"))
+        owner_callback(self.on_subagents_stop, F.data.startswith("agents:stop:"))
+        owner_callback(self.on_info_action, F.data.startswith("info:"))
+        owner_callback(self.on_approval_full_access, F.data.startswith("approval_full:"))
+        owner_callback(self.on_full_access_selected, F.data.startswith("fullaccess:"))
+        owner_callback(self.on_busy_input, F.data.startswith("busy:"))
+        self.router.message.register(self.on_photo, F.photo, self._authorized_input)
         self.router.message.register(
             self.on_image_document,
             F.document & F.document.mime_type.startswith("image/"),
+            self._authorized_input,
         )
-        self.router.message.register(self.on_document, F.document)
-        self.router.message.register(self.on_audio, F.voice)
-        self.router.message.register(self.on_audio, F.audio)
-        self.router.message.register(self.on_message, F.text & ~F.text.startswith("/"))
+        self.router.message.register(self.on_document, F.document, self._authorized_input)
+        self.router.message.register(self.on_audio, F.voice, self._authorized_input)
+        self.router.message.register(self.on_audio, F.audio, self._authorized_input)
+        self.router.message.register(
+            self.on_message, F.text & ~F.text.startswith("/"), self._authorized_input
+        )
         self.router.errors.register(self.on_error)
+
+    def _owner_only(self, event: Message | CallbackQuery) -> bool:
+        return bool(
+            event.from_user
+            and event.from_user.id == self.config.telegram_user_id
+        )
+
+    def _authorized_input(self, message: Message) -> bool:
+        if self._owner_only(message):
+            return True
+        if (
+            not message.from_user
+            or message.chat.type != "private"
+            or message.from_user.id != message.chat.id
+        ):
+            return False
+        key = self._topic_key(message)
+        return self.shares.resolve(key) is not None
 
     async def on_error(self, event: ErrorEvent) -> bool:
         error = event.exception
@@ -1099,6 +1097,16 @@ class TelegramCodexBot:
 
     async def on_start(self, message: Message) -> None:
         log.info("/start chat=%s thread=%s", message.chat.id, message.message_thread_id)
+        if not self._owner_only(message):
+            if message.chat.type == "private" and message.from_user:
+                self.shares.record_user(
+                    message.from_user.id,
+                    message.from_user.username,
+                    message.from_user.full_name,
+                    private_started=True,
+                )
+                await message.answer("Чтобы открыть общий топик, используйте приглашение владельца.")
+            return
         if message.chat.type == "private":
             try:
                 self.bot_info = await self.bot.get_me()
@@ -3154,7 +3162,15 @@ class TelegramCodexBot:
         media_kind: str | None = None,
     ) -> bool:
         session = self._session(message)
-        queued_input = QueuedInput(input_items, input_chars, media_kind)
+        author = message.from_user
+        queued_input = QueuedInput(
+            input_items,
+            input_chars,
+            media_kind,
+            origin_user_id=author.id if author else None,
+            origin_name=author.full_name if author else None,
+            guest_turn=bool(author and author.id != self.config.telegram_user_id),
+        )
         async with session.lock:
             if reserved:
                 if not session.preparing or session.preparation_cancelled:
@@ -3193,7 +3209,10 @@ class TelegramCodexBot:
                 if session.thread_id:
                     self._clear_subagents(root_thread_id=session.thread_id)
                 await self._send_typing_key(session.key)
-                result = await self._start_user_turn(session, queued_input.input_items)
+                result = await self._start_user_turn(
+                    session, queued_input.input_items,
+                    guest_turn=queued_input.guest_turn,
+                )
                 turn_id = result["turn"]["id"]
                 session.active_turn_id = turn_id
                 session.stopping = False
@@ -3471,7 +3490,8 @@ class TelegramCodexBot:
         return wav
 
     async def _start_user_turn(
-        self, session: Session, input_items: list[dict[str, Any]]
+        self, session: Session, input_items: list[dict[str, Any]],
+        *, guest_turn: bool = False,
     ) -> dict[str, Any]:
         last_error: CodexRPCError | None = None
         current_user_text = self._input_text(input_items)
@@ -3484,7 +3504,7 @@ class TelegramCodexBot:
                 # Re-apply access on every turn.  This is important for
                 # threads created by an older bot version whose thread-level
                 # sandbox silently fell back to read-only.
-                **self._thread_access_params(session),
+                **self._thread_access_params(session, guest_turn=guest_turn),
             }
             if session.model:
                 turn_params["model"] = session.model
@@ -5103,8 +5123,10 @@ class TelegramCodexBot:
             return False
         return True
 
-    def _thread_access_params(self, session: Session) -> dict[str, Any]:
-        if self._full_access_enabled():
+    def _thread_access_params(
+        self, session: Session, *, guest_turn: bool = False
+    ) -> dict[str, Any]:
+        if self._full_access_enabled() and not guest_turn:
             return {
                 "approvalPolicy": "never",
                 "sandboxPolicy": {"type": "dangerFullAccess"},
@@ -5561,13 +5583,17 @@ class TelegramCodexBot:
             return sent
 
     def _session(self, message: Message) -> Session:
+        key = self._topic_key(message)
+        owner_key = self.shares.resolve(key)
+        return self._session_for_key(owner_key or key)
+
+    @staticmethod
+    def _topic_key(message: Message) -> TopicKey:
         if message.direct_messages_topic:
-            key = (message.chat.id, "direct", message.direct_messages_topic.topic_id)
-        elif message.message_thread_id:
-            key = (message.chat.id, "forum", message.message_thread_id)
-        else:
-            key = (message.chat.id, "chat", 0)
-        return self._session_for_key(key)
+            return (message.chat.id, "direct", message.direct_messages_topic.topic_id)
+        if message.message_thread_id:
+            return (message.chat.id, "forum", message.message_thread_id)
+        return (message.chat.id, "chat", 0)
 
     def _session_for_key(self, key: TopicKey) -> Session:
         session = self.sessions.get(key)
