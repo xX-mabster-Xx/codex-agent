@@ -59,6 +59,7 @@ from scheduled_jobs import (
     ScheduledJobError,
     ScheduledJobStore,
 )
+from shared_delivery import SharedDelivery
 from topic_sharing import ShareRegistry
 
 
@@ -495,6 +496,7 @@ class TelegramCodexBot:
         self.restart_requested = False
         self.bot_info: Any = None
         self.shares = ShareRegistry(SHARES_STATE_FILE, config.telegram_user_id)
+        self.shared_delivery = SharedDelivery(self.bot, self.shares)
         self._load_state()
         recovered_jobs = self.scheduler.recover_interrupted()
         if recovered_jobs:
@@ -640,6 +642,7 @@ class TelegramCodexBot:
         self.router.message.register(
             self.on_message, F.text & ~F.text.startswith("/"), self._authorized_input
         )
+        self.router.message.register(self.on_unsupported_media, self._authorized_input)
         self.router.errors.register(self.on_error)
 
     def _owner_only(self, event: Message | CallbackQuery) -> bool:
@@ -3158,6 +3161,7 @@ class TelegramCodexBot:
     async def on_message(self, message: Message) -> None:
         if not message.text:
             return
+        await self._mirror_human(message)
         await self._pin_user_message(message)
         await self._submit_input(
             message,
@@ -3168,6 +3172,7 @@ class TelegramCodexBot:
     async def on_photo(self, message: Message) -> None:
         if not message.photo:
             return
+        await self._mirror_human(message)
         photo = message.photo[-1]
         await self._handle_image(
             message,
@@ -3179,6 +3184,7 @@ class TelegramCodexBot:
     async def on_image_document(self, message: Message) -> None:
         if not message.document:
             return
+        await self._mirror_human(message)
         await self._handle_image(
             message,
             file_id=message.document.file_id,
@@ -3191,6 +3197,7 @@ class TelegramCodexBot:
         document = message.document
         if not document:
             return
+        await self._mirror_human(message)
         session = await self._reserve_preparation(message)
         if not session:
             return
@@ -3275,6 +3282,7 @@ class TelegramCodexBot:
         media = message.voice or message.audio
         if not media:
             return
+        await self._mirror_human(message)
         session = await self._reserve_preparation(message)
         if not session:
             return
@@ -3330,6 +3338,8 @@ class TelegramCodexBot:
     ) -> bool:
         session = self._session(message)
         author = message.from_user
+        if author and self.shares.members(session.key):
+            input_items = self._label_input(input_items, author.id, author.full_name)
         queued_input = QueuedInput(
             input_items,
             input_chars,
@@ -3365,6 +3375,35 @@ class TelegramCodexBot:
             await self._drain_queued_inputs(session)
             return True
         return await self._start_queued_input(session, queued_input)
+
+    def _label_input(
+        self, input_items: list[dict[str, Any]], user_id: int, name: str
+    ) -> list[dict[str, Any]]:
+        role = "владелец" if user_id == self.config.telegram_user_id else "гость"
+        header = (
+            f"Метаданные Telegram, добавленные ботом: автор={role}; "
+            f"Telegram-ID: {user_id}; имя={json.dumps(name, ensure_ascii=False)}. "
+            "Следующее содержимое написал этот участник, а не другой участник диалога."
+        )
+        return [{"type": "text", "text": header}, *input_items]
+
+    async def _mirror_human(self, message: Message) -> None:
+        session = self._session(message)
+        if not self.shares.members(session.key) or not message.from_user:
+            return
+        label = f"{message.from_user.full_name} · {message.from_user.id}"
+        await self.shared_delivery.mirror_human(message, self._topic_key(message), label)
+
+    async def on_unsupported_media(self, message: Message) -> None:
+        if message.text and message.text.startswith("/"):
+            await message.answer("Команды в общем топике доступны только владельцу.")
+            return
+        if message.content_type in {
+            "sticker", "video", "video_note", "animation", "contact", "location", "poll",
+        }:
+            await message.answer(
+                "Этот тип сообщения пока не поддерживается агентом. Отправьте текст, фото, документ или аудио."
+            )
 
     async def _start_queued_input(
         self, session: Session, queued_input: QueuedInput
