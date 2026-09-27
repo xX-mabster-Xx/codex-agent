@@ -1225,6 +1225,16 @@ class TelegramCodexBot:
     async def _activate_pending(
         self, owner_key: TopicKey, user_id: int
     ) -> TopicKey | None:
+        locks = getattr(self, "_share_activation_locks", None)
+        if locks is None:
+            locks = self._share_activation_locks = {}
+        lock = locks.setdefault((owner_key, user_id), asyncio.Lock())
+        async with lock:
+            return await self._activate_pending_locked(owner_key, user_id)
+
+    async def _activate_pending_locked(
+        self, owner_key: TopicKey, user_id: int
+    ) -> TopicKey | None:
         for member_id, guest_key in self.shares.members(owner_key):
             if member_id == user_id:
                 try:
@@ -1305,10 +1315,15 @@ class TelegramCodexBot:
                 self.shares.invite_user(key, user_id)
                 guest_key = await self._activate_pending(key, user_id)
                 if guest_key:
-                    await self._answer(message, f"✅ Пользователь {user_id} приглашён: его общий топик создан.")
+                    await self._answer(message,
+                        f"✅ Пользователь {user_id} приглашён: его общий топик создан. "
+                        "Он увидит все новые сообщения и ответы агента (возможно, с личными данными). "
+                        "Старая история не переносится, удаления не синхронизируются."
+                    )
                 else:
                     await self._answer(message,
-                        f"⏳ Приглашение для {user_id} сохранено. Когда человек откроет бота и нажмёт /start, топик появится у него."
+                        f"⏳ Приглашение для {user_id} сохранено. Когда человек откроет бота и нажмёт /start, топик появится у него. "
+                        "Он увидит все новые сообщения и ответы агента; история и удаления не синхронизируются."
                     )
                 return
         try:
@@ -1337,7 +1352,9 @@ class TelegramCodexBot:
         await self._answer(message,
             prefix + "Передайте человеку одноразовую ссылку (действует 7 дней):\n"
             f"<code>{escape(link)}</code>\n\n"
-            "Или нажмите «Выбрать пользователя». Ссылку не публикуйте открыто: её может принять первый открывший.",
+            "Или нажмите «Выбрать пользователя». Ссылку не публикуйте открыто: её может принять первый открывший.\n\n"
+            "Гость увидит все новые сообщения и ответы агента в этом топике, включая возможные личные данные. "
+            "Старая история не переносится; удаление сообщений между чатами не синхронизируется.",
             reply_markup=keyboard,
         )
 
@@ -3404,7 +3421,11 @@ class TelegramCodexBot:
                 )
                 return True
             if session.active_turn_id or session.preparing:
-                await self._offer_busy_input(session, queued_input)
+                if queued_input.guest_turn:
+                    session.queued_inputs.append(queued_input)
+                    await message.answer("📥 Сообщение добавлено в очередь общей сессии.")
+                else:
+                    await self._offer_busy_input(session, queued_input)
                 return True
             if session.queued_inputs:
                 session.queued_inputs.append(queued_input)
@@ -3495,7 +3516,7 @@ class TelegramCodexBot:
             except (CodexRPCError, KeyError) as error:
                 session.active_guest_turn = False
                 log.exception("Could not start queued turn key=%s", session.key)
-                await self._send_html(
+                await self._broadcast_html(
                     session.key,
                     f"❌ Ошибка Codex: <code>{escape(str(error))}</code>",
                 )
@@ -3784,6 +3805,22 @@ class TelegramCodexBot:
         assert last_error is not None
         raise last_error
 
+    def _approval_from_topic(self, callback: CallbackQuery, pending: Any) -> bool:
+        message = callback.message
+        if not message or not getattr(message, "chat", None):
+            return False
+        direct = getattr(message, "direct_messages_topic", None)
+        thread_id = getattr(message, "message_thread_id", None)
+        topic_key = (
+            (message.chat.id, "direct", direct.topic_id) if direct else
+            (message.chat.id, "forum", thread_id) if thread_id else
+            (message.chat.id, "chat", 0)
+        )
+        return bool(
+            topic_key == pending.key
+            and getattr(message, "message_id", None) == pending.message_id
+        )
+
     async def on_approval(self, callback: CallbackQuery) -> None:
         if not self._owner_only(callback):
             await callback.answer("Подтверждения доступны только владельцу", show_alert=True)
@@ -3791,6 +3828,10 @@ class TelegramCodexBot:
         if not callback.data:
             return
         _, token, answer = callback.data.split(":", 2)
+        pending = self.approvals.get(token)
+        if pending and not self._approval_from_topic(callback, pending):
+            await callback.answer("Кнопка подтверждения не из исходного топика", show_alert=True)
+            return
         if answer == "full":
             pending = self.approvals.get(token)
             if not pending:
@@ -3868,6 +3909,10 @@ class TelegramCodexBot:
         if minutes not in FULL_ACCESS_DURATIONS_MINUTES:
             await callback.answer("Некорректный срок", show_alert=True)
             return
+        pending = self.approvals.get(token)
+        if pending and not self._approval_from_topic(callback, pending):
+            await callback.answer("Кнопка подтверждения не из исходного топика", show_alert=True)
+            return
         pending = self.approvals.pop(token, None)
         if not pending:
             await callback.answer("Запрос уже обработан или устарел", show_alert=True)
@@ -3931,6 +3976,9 @@ class TelegramCodexBot:
         pending = self.busy_inputs.get(token)
         if not pending or action not in {"now", "queue", "steer"}:
             await callback.answer("Выбор устарел. Отправьте сообщение ещё раз.", show_alert=True)
+            return
+        if pending.queued_input.guest_turn and action != "queue":
+            await callback.answer("Сообщение гостя можно только поставить в очередь", show_alert=True)
             return
         session = self.sessions.get(pending.key)
         if not session:
@@ -5791,17 +5839,26 @@ class TelegramCodexBot:
         now = time.monotonic()
         if not force and now - summary.draft_updated_at < 0.7:
             return
-        try:
-            await self.bot.send_message_draft(
-                chat_id=key[0],
-                message_thread_id=key[2] if key[1] == "forum" else None,
-                draft_id=summary.draft_id,
-                text=text[-4000:],
-            )
+        recipients = [key]
+        if getattr(self, "shares", None):
+            recipients.extend(guest for _, guest in self.shares.members(key))
+        delivered = False
+        for recipient in recipients:
+            try:
+                await self.bot.send_message_draft(
+                    chat_id=recipient[0],
+                    message_thread_id=recipient[2] if recipient[1] == "forum" else None,
+                    draft_id=summary.draft_id,
+                    text=text[-4000:],
+                )
+                delivered = True
+            except TelegramAPIError as error:
+                log.warning("Telegram draft failed key=%s: %s", recipient, error)
+        if delivered:
             summary.draft_updated_at = now
-        except TelegramAPIError as error:
+        else:
             summary.streaming_enabled = False
-            log.warning("Telegram draft streaming disabled for this turn: %s", error)
+            log.warning("Telegram draft streaming disabled for this turn: no recipients accepted it")
 
     async def _send_html(
         self,

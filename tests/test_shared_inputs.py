@@ -110,7 +110,8 @@ def test_queued_guest_turn_retains_origin_and_policy(tmp_path):
         message(202, 22, text="next"), [{"type": "text", "text": "next"}], input_chars=4,
     ))
 
-    queued = bot._offer_busy_input.await_args.args[1]
+    bot._offer_busy_input.assert_not_awaited()
+    queued = bot.sessions[OWNER].queued_inputs[0]
     assert queued.origin_user_id == 202
     assert queued.guest_turn is True
     assert "Telegram-ID: 202" in queued.input_items[0]["text"]

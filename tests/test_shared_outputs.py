@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 from bot import Session, TelegramCodexBot, TurnSummary
-from codex_client import ServerRequest
+from codex_client import CodexRPCError, ServerRequest
 from shared_delivery import SharedDelivery
 from topic_sharing import ShareRegistry
 
@@ -126,6 +126,52 @@ def test_agent_activity_uses_shared_delivery(tmp_path):
     asyncio.run(bot._update_activity(OWNER, TurnSummary(activity_title="Working"), force=True))
 
     assert {call["chat_id"] for call in calls} == {101, 202}
+
+
+def test_live_draft_reaches_guest(tmp_path):
+    shared, telegram, _ = delivery(tmp_path)
+    telegram.send_message_draft = AsyncMock()
+    bot = object.__new__(TelegramCodexBot)
+    bot.bot = telegram
+    bot.shares = shared.shares
+    summary = TurnSummary()
+
+    asyncio.run(bot._update_draft(OWNER, summary, "Working", force=True))
+
+    assert {call.kwargs["chat_id"] for call in telegram.send_message_draft.await_args_list} == {101, 202}
+
+
+def test_turn_start_error_is_broadcast(tmp_path):
+    shared, telegram, calls = delivery(tmp_path)
+    bot = object.__new__(TelegramCodexBot)
+    bot.bot = telegram
+    bot.shares = shared.shares
+    bot.shared_delivery = shared
+    bot.agent_message_topics = {}
+    bot.sessions = {OWNER: Session(OWNER)}
+    bot._clear_subagents = lambda **_kwargs: None
+    bot._send_typing_key = AsyncMock()
+    bot._start_user_turn = AsyncMock(side_effect=CodexRPCError("offline"))
+    bot._stop_typing_if_idle = lambda _session: None
+    queued = SimpleNamespace(input_items=[{"type": "text", "text": "hello"}],
+                             guest_turn=True, input_chars=5, media_kind=None)
+
+    asyncio.run(bot._start_queued_input(bot.sessions[OWNER], queued))
+
+    assert {c["chat_id"] for c in calls} == {101, 202}
+    assert all("offline" in c["text"] for c in calls)
+
+
+def test_guest_origin_cannot_be_steered_into_owner_turn(tmp_path):
+    bot = object.__new__(TelegramCodexBot)
+    bot.busy_inputs = {"token": SimpleNamespace(queued_input=SimpleNamespace(guest_turn=True))}
+    bot._steer_active_turn = AsyncMock()
+    callback = SimpleNamespace(data="busy:token:steer", answer=AsyncMock())
+
+    asyncio.run(bot.on_busy_input(callback))
+
+    bot._steer_active_turn.assert_not_awaited()
+    assert "token" in bot.busy_inputs
 
 
 def test_guest_request_never_uses_owner_full_access(tmp_path):
