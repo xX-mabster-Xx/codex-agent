@@ -368,6 +368,7 @@ class Session:
     pending_context_providers: set[str] = field(default_factory=set)
     attached: bool = False
     active_turn_id: str | None = None
+    active_guest_turn: bool = False
     stopping: bool = False
     preparing: bool = False
     preparation_cancelled: bool = False
@@ -3415,6 +3416,7 @@ class TelegramCodexBot:
                 if session.thread_id:
                     self._clear_subagents(root_thread_id=session.thread_id)
                 await self._send_typing_key(session.key)
+                session.active_guest_turn = queued_input.guest_turn
                 result = await self._start_user_turn(
                     session, queued_input.input_items,
                     guest_turn=queued_input.guest_turn,
@@ -3446,6 +3448,7 @@ class TelegramCodexBot:
                 self._ensure_typing_loop(session)
                 return True
             except (CodexRPCError, KeyError) as error:
+                session.active_guest_turn = False
                 log.exception("Could not start queued turn key=%s", session.key)
                 await self._send_html(
                     session.key,
@@ -3737,6 +3740,9 @@ class TelegramCodexBot:
         raise last_error
 
     async def on_approval(self, callback: CallbackQuery) -> None:
+        if not self._owner_only(callback):
+            await callback.answer("Подтверждения доступны только владельцу", show_alert=True)
+            return
         if not callback.data:
             return
         _, token, answer = callback.data.split(":", 2)
@@ -3799,8 +3805,13 @@ class TelegramCodexBot:
             except TelegramAPIError:
                 await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer("Разрешено" if answer == "yes" else "Запрещено")
+        if getattr(self, "shared_delivery", None):
+            await self.shared_delivery.notify_approval_result(pending.key, allowed)
 
     async def on_approval_full_access(self, callback: CallbackQuery) -> None:
+        if not self._owner_only(callback):
+            await callback.answer("Подтверждения доступны только владельцу", show_alert=True)
+            return
         if not callback.data:
             return
         try:
@@ -3838,6 +3849,8 @@ class TelegramCodexBot:
             except TelegramAPIError:
                 await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer("Полный доступ включён")
+        if getattr(self, "shared_delivery", None):
+            await self.shared_delivery.notify_approval_result(pending.key, True)
 
     async def on_full_access_selected(self, callback: CallbackQuery) -> None:
         if not callback.data or not callback.message:
@@ -4200,6 +4213,7 @@ class TelegramCodexBot:
                     summary.error_text = completion_error
                 if session.active_turn_id == turn_id:
                     session.active_turn_id = None
+                    session.active_guest_turn = False
                     session.stopping = False
                     self._stop_typing_if_idle(session)
                 if summary.final_text:
@@ -4310,7 +4324,7 @@ class TelegramCodexBot:
                 f"<pre>{escape(command[:2400])}</pre>"
                 + (f"\n📂 <code>{escape(cwd)}</code>" if cwd else "")
             )
-            sent = await self._send_html(key, text)
+            sent = await self._broadcast_html(key, text)
             if sent:
                 summary.command_messages[item_id] = sent.message_id
             await self._update_activity(key, summary)
@@ -4357,7 +4371,7 @@ class TelegramCodexBot:
                 # Every completed assistant text is permanent. Previously only
                 # the last one survived until turn/completed, which silently
                 # discarded useful commentary and intermediate answers.
-                await self._send_markdown(key, text, silent=True)
+                await self._broadcast_markdown(key, text, silent=True)
                 summary.sent_agent_message_ids.add(item_id)
             self._set_activity(summary, "✍️ Ответ отправлен")
             await self._update_activity(key, summary)
@@ -4400,10 +4414,10 @@ class TelegramCodexBot:
                 )
             message_id = summary.command_messages.get(item_id)
             if message_id:
-                if not await self._edit_html(key, message_id, details):
-                    await self._send_html(key, details)
+                if not await self._broadcast_edit_html(key, message_id, details):
+                    await self._broadcast_html(key, details)
             else:
-                await self._send_html(key, details)
+                await self._broadcast_html(key, details)
             self._set_activity(
                 summary,
                 "✅ Команда завершена" if icon == "✅" else "❌ Команда завершилась с ошибкой",
@@ -4476,12 +4490,7 @@ class TelegramCodexBot:
             f"{escape(output[-1400:])}</blockquote>"
         )
         try:
-            await self.bot.edit_message_text(
-                text,
-                chat_id=key[0],
-                message_id=message_id,
-                link_preview_options={"is_disabled": True},
-            )
+            await self._broadcast_edit_html(key, message_id, text)
             summary.command_updated_at[item_id] = now
         except TelegramBadRequest as error:
             if "message is not modified" not in str(error).lower():
@@ -4539,6 +4548,8 @@ class TelegramCodexBot:
                 request.id, self._approval_response(request, False)
             )
             return
+        session = self.sessions.get(key)
+        guest_turn = bool(session and session.active_guest_turn)
 
         if self._is_plain_sudo_command(request):
             await client.respond(request.id, self._approval_response(request, False))
@@ -4550,7 +4561,7 @@ class TelegramCodexBot:
             )
             return
 
-        if self._is_google_calendar_mcp_request(request):
+        if not guest_turn and self._is_google_calendar_mcp_request(request):
             await client.respond(request.id, self._approval_response(request, True))
             log.info(
                 "Auto-approved Google Calendar MCP request key=%s method=%s request_id=%s",
@@ -4560,7 +4571,7 @@ class TelegramCodexBot:
             )
             return
 
-        if self._is_memory_mcp_request(request):
+        if not guest_turn and self._is_memory_mcp_request(request):
             await client.respond(request.id, self._approval_response(request, True))
             log.info(
                 "Auto-approved shared memory MCP request key=%s tool=%s request_id=%s",
@@ -4570,7 +4581,7 @@ class TelegramCodexBot:
             )
             return
 
-        if self._is_auto_approved_telegram_request(request):
+        if not guest_turn and self._is_auto_approved_telegram_request(request):
             await client.respond(request.id, self._approval_response(request, True))
             log.info(
                 "Auto-approved Telegram request by account policy key=%s tool=%s request_id=%s",
@@ -4580,7 +4591,7 @@ class TelegramCodexBot:
             )
             return
 
-        if self._is_agent_scheduler_follow_up_request(key, request):
+        if not guest_turn and self._is_agent_scheduler_follow_up_request(key, request):
             await client.respond(request.id, self._approval_response(request, True))
             log.info(
                 "Auto-approved agent scheduler follow-up key=%s request_id=%s",
@@ -4589,7 +4600,7 @@ class TelegramCodexBot:
             )
             return
 
-        if self._is_native_bot_delivery_request(request):
+        if not guest_turn and self._is_native_bot_delivery_request(request):
             await client.respond(request.id, self._approval_response(request, True))
             log.info(
                 "Auto-approved native bot file delivery key=%s request_id=%s",
@@ -4598,7 +4609,7 @@ class TelegramCodexBot:
             )
             return
 
-        if self._should_auto_approve_with_full_access(request):
+        if not guest_turn and self._should_auto_approve_with_full_access(request):
             await client.respond(request.id, self._approval_response(request, True))
             log.info(
                 "Auto-approved with temporary full access key=%s method=%s request_id=%s",
@@ -4608,7 +4619,7 @@ class TelegramCodexBot:
             )
             return
 
-        if self._is_safe_file_change(key, provider, request):
+        if not guest_turn and self._is_safe_file_change(key, provider, request):
             await client.respond(request.id, self._approval_response(request, True))
             log.info(
                 "Auto-approved trusted file change key=%s request_id=%s",
@@ -4679,6 +4690,8 @@ class TelegramCodexBot:
             )
             if self.approvals.get(token) is pending:
                 pending.message_id = sent.message_id
+                if getattr(self, "shared_delivery", None):
+                    await self.shared_delivery.notify_approval_waiting(key)
                 log.info(
                     "Approval requested key=%s method=%s request_id=%s",
                     key,
@@ -5407,7 +5420,7 @@ class TelegramCodexBot:
         # terminal agent message. Ordinary messages are quiet; completion itself
         # produces the audible notification below.
         if summary.final_text and not summary.sent_agent_message_ids:
-            await self._send_markdown(key, summary.final_text, silent=True)
+            await self._broadcast_markdown(key, summary.final_text, silent=True)
 
         normalized = status.casefold()
         if summary.error_text or normalized not in {"completed"}:
@@ -5426,7 +5439,7 @@ class TelegramCodexBot:
             )
         else:
             completion = f"⚠️ <b>Работа завершена: {escape(status)}</b>"
-        await self._send_html(key, completion, silent=False)
+        await self._broadcast_html(key, completion, silent=False)
 
     async def _finalize_unfinished_commands(
         self, key: TopicKey, summary: TurnSummary, status: str
@@ -5440,7 +5453,7 @@ class TelegramCodexBot:
                 f" · turn <code>{escape(status)}</code>"
                 f"\n<pre>{escape(command[:2200])}</pre>"
             )
-            await self._edit_html(key, message_id, text)
+            await self._broadcast_edit_html(key, message_id, text)
 
     @staticmethod
     def _set_activity(
@@ -5472,10 +5485,10 @@ class TelegramCodexBot:
         )
         candidate = "\n\n".join((*summary.reasoning_blocks, block))
         if summary.reasoning_message_id and len(candidate) <= 3900:
-            if await self._edit_html(key, summary.reasoning_message_id, candidate):
+            if await self._broadcast_edit_html(key, summary.reasoning_message_id, candidate):
                 summary.reasoning_blocks.append(block)
                 return
-        sent = await self._send_html(key, block)
+        sent = await self._broadcast_html(key, block)
         summary.reasoning_message_id = sent.message_id
         summary.reasoning_blocks = [block]
 
@@ -5485,7 +5498,7 @@ class TelegramCodexBot:
         text = text.strip()
         if not text or text == summary.plan_text:
             return
-        new_messages = await self._send_markdown(key, f"## 📋 План\n\n{text}")
+        new_messages = await self._broadcast_markdown(key, f"## 📋 План\n\n{text}")
         if not new_messages:
             return
         old_message_ids = summary.plan_message_ids
@@ -5525,10 +5538,10 @@ class TelegramCodexBot:
             return
         text = self._activity_text(summary, status)
         if summary.activity_message_id:
-            if await self._edit_html(key, summary.activity_message_id, text):
+            if await self._broadcast_edit_html(key, summary.activity_message_id, text):
                 summary.activity_updated_at = now
             return
-        sent = await self._send_html(key, text)
+        sent = await self._broadcast_html(key, text)
         summary.activity_message_id = sent.message_id
         summary.activity_updated_at = now
 
@@ -5606,6 +5619,34 @@ class TelegramCodexBot:
         except TelegramAPIError as error:
             log.warning("Temporary Telegram edit failure message=%s: %s", message_id, error)
             return True
+
+    async def _broadcast_html(
+        self, key: TopicKey, text: str, *, silent: bool = True
+    ) -> Message:
+        if not getattr(self, "shares", None) or not self.shares.members(key):
+            return await self._send_html(key, text, silent=silent)
+        sent = await self.shared_delivery.broadcast_html(key, text, silent=silent)
+        self._remember_agent_message(key, sent)
+        return sent
+
+    async def _broadcast_markdown(
+        self, key: TopicKey, text: str, *, silent: bool = True
+    ) -> list[Message]:
+        if not getattr(self, "shares", None) or not self.shares.members(key) or GOOGLE_OAUTH_URL_RE.search(text):
+            # OAuth buttons and their URLs are owner-only actions.
+            return await self._send_markdown(key, text, silent=silent)
+        sent = await self.shared_delivery.broadcast_markdown(key, text, silent=silent)
+        for message in sent:
+            self._remember_agent_message(key, message)
+        return sent
+
+    async def _broadcast_edit_html(
+        self, key: TopicKey, message_id: int, text: str
+    ) -> bool:
+        if not getattr(self, "shares", None) or not self.shares.members(key):
+            return await self._edit_html(key, message_id, text)
+        await self.shared_delivery.broadcast_edit(key, message_id, text)
+        return True
 
     async def _send_markdown(
         self, key: TopicKey, text: str, *, silent: bool = True
