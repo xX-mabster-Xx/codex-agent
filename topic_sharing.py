@@ -206,7 +206,8 @@ class ShareRegistry:
         if now >= expires:
             self._save()
             return None
-        self.pending.setdefault(user_id, set()).add(key)
+        if (key, user_id) not in self._members:
+            self.pending.setdefault(user_id, set()).add(key)
         self._save()
         return key
 
@@ -262,6 +263,29 @@ class ShareRegistry:
             ((user_id, guest) for (key, user_id), guest in self._members.items() if key == owner_key),
             key=lambda value: value[0],
         )
+
+    def linked_for(self, user_id: int) -> list[tuple[TopicKey, TopicKey]]:
+        return sorted(
+            ((owner, guest) for (owner, member_id), guest in self._members.items()
+             if member_id == user_id),
+            key=lambda value: value[0],
+        )
+
+    def replace_topic(self, owner_key: TopicKey, user_id: int, guest_key: TopicKey) -> None:
+        """Replace only an existing member's deleted private topic."""
+        self._owner_key(owner_key)
+        self._guest_id(user_id)
+        if (owner_key, user_id) not in self._members:
+            raise ValueError("member is not linked")
+        if _read_key(list(guest_key)) != guest_key or guest_key[0] != user_id:
+            raise ValueError("replacement must belong to member")
+        if guest_key in self._guest_to_owner:
+            raise ValueError("replacement topic is already shared")
+        old_key = self._members[owner_key, user_id]
+        self._guest_to_owner.pop(old_key, None)
+        self._members[owner_key, user_id] = guest_key
+        self._guest_to_owner[guest_key] = owner_key
+        self._save()
 
     def revoke(self, owner_key: TopicKey, user_id: int) -> None:
         self._owner_key(owner_key)

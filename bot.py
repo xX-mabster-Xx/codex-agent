@@ -644,6 +644,7 @@ class TelegramCodexBot:
             self.on_message, F.text & ~F.text.startswith("/"), self._authorized_input
         )
         self.router.message.register(self.on_unsupported_media, self._authorized_input)
+        self.router.edited_message.register(self.on_edited_message, self._authorized_input)
         self.router.errors.register(self.on_error)
 
     def _owner_only(self, event: Message | CallbackQuery) -> bool:
@@ -1124,16 +1125,17 @@ class TelegramCodexBot:
                 ):
                     await message.answer("Ссылка недействительна или срок её действия истёк.")
                     return
+                linked = self.shares.linked_for(message.from_user.id)
                 pending = self.shares.pending_for(message.from_user.id)
-                if not pending:
+                if not pending and not linked:
                     await message.answer("Доступных общих топиков пока нет. Попросите владельца прислать приглашение.")
                     return
                 opened = 0
-                for owner_key in pending:
+                for owner_key in sorted(set(pending) | {owner for owner, _ in linked}):
                     if await self._activate_pending(owner_key, message.from_user.id):
                         opened += 1
                 if opened:
-                    await message.answer(f"Готово: открыто общих топиков — {opened}.")
+                    await message.answer(f"Доступных общих топиков — {opened}. Они видны в списке топиков этого чата.")
                 else:
                     await message.answer(
                         "Приглашение сохранено, но пока не удалось открыть топик. "
@@ -1225,7 +1227,36 @@ class TelegramCodexBot:
     ) -> TopicKey | None:
         for member_id, guest_key in self.shares.members(owner_key):
             if member_id == user_id:
-                return guest_key
+                try:
+                    await self.bot.send_message(
+                        chat_id=user_id, message_thread_id=guest_key[2],
+                        text="🔗 Этот общий топик доступен вам. Новые сообщения видны участникам.",
+                        disable_notification=True,
+                    )
+                    return guest_key
+                except TelegramBadRequest as error:
+                    if not self._missing_guest_topic(error):
+                        log.warning("Cannot verify shared topic %s: %s", guest_key, error)
+                        return None
+                    try:
+                        session = self._session_for_key(owner_key)
+                        topic = await self.bot.create_forum_topic(
+                            chat_id=user_id, name=(session.topic_name or "Общий топик")[:128]
+                        )
+                        replacement = (user_id, "forum", topic.message_thread_id)
+                        self.shares.replace_topic(owner_key, user_id, replacement)
+                        await self.bot.send_message(
+                            chat_id=user_id, message_thread_id=replacement[2],
+                            text="🔗 Общий топик восстановлен. Старые сообщения не переносятся.",
+                            disable_notification=True,
+                        )
+                        return replacement
+                    except TelegramAPIError as recovery_error:
+                        log.warning("Cannot recreate shared topic %s: %s", guest_key, recovery_error)
+                        return None
+                except TelegramAPIError as error:
+                    log.warning("Cannot verify shared topic %s: %s", guest_key, error)
+                    return None
         if owner_key not in self.shares.pending_for(user_id):
             return None
         session = self._session_for_key(owner_key)
@@ -1249,6 +1280,14 @@ class TelegramCodexBot:
             except TelegramAPIError as error:
                 log.warning("Shared topic notice failed key=%s: %s", key, error)
         return guest_key
+
+    @staticmethod
+    def _missing_guest_topic(error: TelegramBadRequest) -> bool:
+        description = str(error).casefold()
+        return any(
+            phrase in description
+            for phrase in ("thread not found", "topic not found", "topic was deleted")
+        )
 
     async def on_share(self, message: Message) -> None:
         key = self._topic_key(message)
@@ -3394,6 +3433,12 @@ class TelegramCodexBot:
             return
         label = f"{message.from_user.full_name} · {message.from_user.id}"
         await self.shared_delivery.mirror_human(message, self._topic_key(message), label)
+
+    async def on_edited_message(self, message: Message) -> None:
+        if message.text is None or not message.from_user:
+            return
+        label = f"{message.from_user.full_name} · {message.from_user.id}"
+        await self.shared_delivery.edit_human(message, label)
 
     async def on_unsupported_media(self, message: Message) -> None:
         if message.text and message.text.startswith("/"):
