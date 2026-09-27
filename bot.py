@@ -35,8 +35,12 @@ from aiogram.types import (
     InputRichMessage,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
+    KeyboardButtonRequestUsers,
     Message,
     MessageReactionUpdated,
+    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 from codex_client import (
@@ -560,6 +564,8 @@ class TelegramCodexBot:
                 BotCommand(command="project", description="Путь текущего проекта"),
                 BotCommand(command="provider", description="Выбрать провайдера"),
                 BotCommand(command="model", description="Выбрать модель Codex"),
+                BotCommand(command="share", description="Поделиться текущим топиком"),
+                BotCommand(command="unshare", description="Отозвать доступ к топику"),
                 BotCommand(command="effort", description="Глубина рассуждений"),
                 BotCommand(command="reasoning", description="Алиас глубины рассуждений"),
                 BotCommand(command="new", description="Новый Codex thread"),
@@ -590,6 +596,8 @@ class TelegramCodexBot:
         owner_message(self.on_project, Command("project"))
         owner_message(self.on_provider, Command("provider"))
         owner_message(self.on_model, Command("model"))
+        owner_message(self.on_share, Command("share"))
+        owner_message(self.on_unshare, Command("unshare"))
         owner_message(self.on_effort, Command(commands=["effort", "reasoning"]))
         owner_message(self.on_new, Command("new"))
         owner_message(self.on_stop, Command("stop"))
@@ -606,6 +614,7 @@ class TelegramCodexBot:
         self.router.message_reaction.register(self.on_message_reaction)
         owner_message(self.on_forum_topic_created, F.forum_topic_created)
         owner_message(self.on_forum_topic_edited, F.forum_topic_edited)
+        owner_message(self.on_users_shared, F.users_shared)
         owner_callback(self.on_new_topic_button, F.data == "topic:new")
         owner_callback(self.on_provider_selected, F.data.startswith("provider:set:"))
         owner_callback(self.on_model_menu, F.data == "model:menu")
@@ -1105,7 +1114,27 @@ class TelegramCodexBot:
                     message.from_user.full_name,
                     private_started=True,
                 )
-                await message.answer("Чтобы открыть общий топик, используйте приглашение владельца.")
+                token = (message.text or "").partition(" ")[2].strip()
+                if token and not self.shares.claim_link(
+                    token, message.from_user.id, time.time()
+                ):
+                    await message.answer("Ссылка недействительна или срок её действия истёк.")
+                    return
+                pending = self.shares.pending_for(message.from_user.id)
+                if not pending:
+                    await message.answer("Доступных общих топиков пока нет. Попросите владельца прислать приглашение.")
+                    return
+                opened = 0
+                for owner_key in pending:
+                    if await self._activate_pending(owner_key, message.from_user.id):
+                        opened += 1
+                if opened:
+                    await message.answer(f"Готово: открыто общих топиков — {opened}.")
+                else:
+                    await message.answer(
+                        "Приглашение сохранено, но пока не удалось открыть топик. "
+                        "Проверьте режим Topics у бота и повторите /start позже."
+                    )
             return
         if message.chat.type == "private":
             try:
@@ -1179,6 +1208,144 @@ class TelegramCodexBot:
             "отложенная задача.",
             reply_markup=keyboard,
         )
+
+    def _share_link(self, owner_key: TopicKey) -> str:
+        token = self.shares.create_link(owner_key, time.time())
+        username = getattr(self.bot_info, "username", None)
+        if not username:
+            raise ValueError("bot username is unavailable")
+        return f"https://t.me/{username}?start={token}"
+
+    async def _activate_pending(
+        self, owner_key: TopicKey, user_id: int
+    ) -> TopicKey | None:
+        for member_id, guest_key in self.shares.members(owner_key):
+            if member_id == user_id:
+                return guest_key
+        if owner_key not in self.shares.pending_for(user_id):
+            return None
+        session = self._session_for_key(owner_key)
+        name = (session.topic_name or "Общий топик")[:128]
+        try:
+            topic = await self.bot.create_forum_topic(chat_id=user_id, name=name)
+        except TelegramAPIError as error:
+            log.info("Shared topic pending user=%s owner=%s: %s", user_id, owner_key, error)
+            return None
+        guest_key = (user_id, "forum", topic.message_thread_id)
+        self.shares.attach(owner_key, user_id, guest_key)
+        for key, text in (
+            (guest_key, "🔗 Общий топик подключён. Новые сообщения видны всем участникам; управление и подтверждения доступны только владельцу."),
+            (owner_key, f"🔗 Пользователь {user_id} подключился к общему топику."),
+        ):
+            try:
+                await self.bot.send_message(
+                    chat_id=key[0], text=text, message_thread_id=key[2],
+                    disable_notification=True,
+                )
+            except TelegramAPIError as error:
+                log.warning("Shared topic notice failed key=%s: %s", key, error)
+        return guest_key
+
+    async def on_share(self, message: Message) -> None:
+        key = self._topic_key(message)
+        if message.chat.type != "private" or key[1] != "forum":
+            await self._answer(message, "Делиться можно только топиком личного чата с ботом.")
+            return
+        target = (message.text or "").partition(" ")[2].strip()
+        if target:
+            user_id: int | None = None
+            if target.isdecimal():
+                user_id = int(target)
+            elif target.startswith("@"):
+                user_id = self.shares.known_user_id(target)
+            if user_id is not None and user_id != self.config.telegram_user_id:
+                self.shares.invite_user(key, user_id)
+                guest_key = await self._activate_pending(key, user_id)
+                if guest_key:
+                    await self._answer(message, f"✅ Пользователь {user_id} приглашён: его общий топик создан.")
+                else:
+                    await self._answer(message,
+                        f"⏳ Приглашение для {user_id} сохранено. Когда человек откроет бота и нажмёт /start, топик появится у него."
+                    )
+                return
+        try:
+            link = self._share_link(key)
+        except ValueError:
+            await self._answer(message, "Не удалось узнать username бота для ссылки.")
+            return
+        request_id = secrets.randbelow(2**31)
+        self.shares.remember_selector(request_id, key)
+        keyboard = ReplyKeyboardMarkup(
+            keyboard=[[KeyboardButton(
+                text="Выбрать пользователя",
+                request_users=KeyboardButtonRequestUsers(
+                    request_id=request_id, user_is_bot=False, max_quantity=1,
+                    request_name=True, request_username=True,
+                ),
+            )]],
+            resize_keyboard=True,
+            one_time_keyboard=True,
+        )
+        prefix = (
+            f"@username {escape(target)} пока неизвестен боту. "
+            "Telegram не позволяет найти личный чат только по имени.\n\n"
+            if target else ""
+        )
+        await self._answer(message,
+            prefix + "Передайте человеку одноразовую ссылку (действует 7 дней):\n"
+            f"<code>{escape(link)}</code>\n\n"
+            "Или нажмите «Выбрать пользователя». Ссылку не публикуйте открыто: её может принять первый открывший.",
+            reply_markup=keyboard,
+        )
+
+    async def on_users_shared(self, message: Message) -> None:
+        selected = message.users_shared
+        if not selected or not selected.users:
+            return
+        owner_key = self.shares.claim_selector(selected.request_id)
+        if owner_key is None:
+            await self._answer(message, "Выбор пользователя устарел. Повторите /share.")
+            return
+        user = selected.users[0]
+        if user.user_id == self.config.telegram_user_id:
+            await self._answer(message, "Нельзя пригласить самого себя.")
+            return
+        name = " ".join(filter(None, (user.first_name, user.last_name)))
+        self.shares.record_user(user.user_id, user.username, name, private_started=False)
+        self.shares.invite_user(owner_key, user.user_id)
+        guest_key = await self._activate_pending(owner_key, user.user_id)
+        state = "Топик создан" if guest_key else "Приглашение сохранено до /start пользователя"
+        await self._answer(message, f"{escape(state)}: {user.user_id}.", reply_markup=ReplyKeyboardRemove())
+
+    async def on_unshare(self, message: Message) -> None:
+        key = self._topic_key(message)
+        if message.chat.type != "private" or key[1] != "forum":
+            await self._answer(message, "Команда работает только в личном топике.")
+            return
+        target = (message.text or "").partition(" ")[2].strip()
+        if not target:
+            members = self.shares.members(key)
+            if not members:
+                await self._answer(message, "В этом топике пока нет приглашённых участников.")
+                return
+            lines = [f"{user_id} — /unshare {user_id}" for user_id, _ in members]
+            await self._answer(message, "Участники:\n" + "\n".join(lines))
+            return
+        user_id = int(target) if target.isdecimal() else self.shares.known_user_id(target)
+        if user_id is None or user_id == self.config.telegram_user_id:
+            await self._answer(message, "Укажите ID участника или известный @username.")
+            return
+        guest_key = next((member_key for member_id, member_key in self.shares.members(key) if member_id == user_id), None)
+        self.shares.revoke(key, user_id)
+        if guest_key:
+            try:
+                await self.bot.send_message(
+                    chat_id=user_id, message_thread_id=guest_key[2],
+                    text="Доступ к общему топику отозван владельцем.",
+                )
+            except TelegramAPIError:
+                pass
+        await self._answer(message, f"Доступ пользователя {user_id} отозван; старые ссылки топика недействительны.")
 
     async def on_topic(self, message: Message) -> None:
         name = (message.text or "").partition(" ")[2].strip()
